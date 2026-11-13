@@ -60,6 +60,16 @@ keeping the latest 14 of each. To run it every night at 03:00, add this line wit
 0 3 * * * /opt/tolie-blog/deploy/backup.sh >> /var/log/tolie-blog-backup.log 2>&1
 ```
 
+### Off-site copies
+
+Backups on the droplet disappear with the droplet. To also keep a copy somewhere else, add the
+`BACKUP_S3_*` settings from `.env.example` to `.env` (DigitalOcean Spaces, AWS S3, Cloudflare R2 and
+Backblaze B2 all work). Every run of `backup.sh` then uploads both files and removes copies older than
+`BACKUP_KEEP_DAYS` days. Nothing needs to be installed: it runs rclone from its Docker image.
+
+To get files back on a new droplet, download them from the bucket (the provider's web page works),
+put them in `/opt/tolie-blog/backups/`, and follow the restore steps below.
+
 Restore the database from a backup:
 
 ```bash
@@ -67,6 +77,14 @@ cd /opt/tolie-blog
 docker compose exec -T db psql -U blog -d blog -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
 gunzip -c backups/blog-YYYYMMDD-HHMM.sql.gz | docker compose exec -T db psql -U blog -d blog
 docker compose restart api
+```
+
+Restore the uploaded images:
+
+```bash
+cd /opt/tolie-blog
+docker run --rm -v tolie-blog_uploads:/data -v "$PWD/backups:/in:ro" alpine \
+  tar xzf /in/uploads-YYYYMMDD-HHMM.tar.gz -C /data
 ```
 
 ## Comments, traffic and sharing

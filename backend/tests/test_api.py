@@ -95,11 +95,27 @@ ok('unpublish keeps published_at for re-publish', J(c, 'put', f'/api/admin/posts
 
 # preview + upload
 pj = J(c, 'post', '/api/admin/preview', {'md': '# Hi <b onclick=x>there</b>'}, tok); ok('preview sanitised', pj.status_code == 200 and 'onclick' not in pj.json['html'] and '<h1' in pj.json['html'])
-png = b'\x89PNG\r\n\x1a\n' + b'\x00' * 40
-up = c.post('/api/admin/upload', data={'file': (io.BytesIO(png), 'pic.png')}, headers={'X-CSRF-Token': tok}, content_type='multipart/form-data'); ok('upload png', up.status_code == 200 and up.json['url'].startswith('/uploads/'))
+from PIL import Image
+def img_bytes(fmt, size=(40, 30), **kw):
+    b = io.BytesIO(); Image.new('RGB', size, (200, 80, 40)).save(b, fmt, **kw); return b.getvalue()
+def upload(data, name='pic'):
+    return c.post('/api/admin/upload', data={'file': (io.BytesIO(data), name)}, headers={'X-CSRF-Token': tok}, content_type='multipart/form-data')
+png = img_bytes('PNG')
+up = upload(png, 'pic.png'); ok('upload png', up.status_code == 200 and up.json['url'].startswith('/uploads/') and up.json['url'].endswith('.webp'))
 ok('upload served immutable', 'immutable' in c.get(up.json['url']).headers['Cache-Control'])
+ok('png kept pixel-exact (lossless)', Image.open(io.BytesIO(c.get(up.json['url']).data)).convert('RGB').getpixel((5, 5)) == (200, 80, 40))
+# a big phone photo, taken sideways, with a GPS position in it
+exif = Image.Exif(); exif[0x0112] = 6; exif[0x8825] = {1: 'S', 2: (6.0, 10.0, 0.0)}
+photo = img_bytes('JPEG', (4000, 3000), quality=95, exif=exif)
+up = upload(photo, 'IMG_0001.jpg'); got = Image.open(io.BytesIO(c.get(up.json['url']).data))
+ok('photo shrunk to 1600 wide, turned upright', up.status_code == 200 and got.format == 'WEBP' and got.size == (1600, 2133))
+ok('photo has no GPS / EXIF left', not got.getexif() and b'Exif' not in c.get(up.json['url']).data)
+ok('upload reports the saving', up.json['size'] < up.json['original_size'])
+frames = [Image.new('RGB', (20, 20), c) for c in ((255, 0, 0), (0, 0, 255))]; gb = io.BytesIO(); frames[0].save(gb, 'GIF', save_all=True, append_images=frames[1:], duration=100, loop=0)
+up = upload(gb.getvalue(), 'dance.gif'); ok('animated gif kept as is', up.json['url'].endswith('.gif') and c.get(up.json['url']).data == gb.getvalue())
+ok('broken image rejected', upload(b'\x89PNG\r\n\x1a\n' + b'\x00' * 40, 'bad.png').status_code == 400)
 ok('svg rejected', c.post('/api/admin/upload', data={'file': (io.BytesIO(b'<svg onload=alert(1)>'), 'x.svg')}, headers={'X-CSRF-Token': tok}, content_type='multipart/form-data').status_code == 400)
-ok('oversize rejected', c.post('/api/admin/upload', data={'file': (io.BytesIO(png + b'0' * (5 * 1024 * 1024)), 'b.png')}, headers={'X-CSRF-Token': tok}, content_type='multipart/form-data').status_code in (400, 413))
+ok('oversize rejected', upload(png + b'0' * (15 * 1024 * 1024), 'b.png').status_code in (400, 413))
 ok('upload traversal blocked', c.get('/uploads/..%2fblog.db').status_code == 404 and c.get('/uploads/evil.png').status_code == 404)
 
 # comments + moderation
@@ -188,10 +204,10 @@ pj = anon.get(f'/api/posts/{H}').json
 ok('toc from headings', [x['title'] for x in pj['post']['toc']] == ['What to expect', 'Code looks like this'] and all(f'id="{x["id"]}"' in pj['post']['html'] for x in pj['post']['toc']))
 ok('read next lists other published posts', [r['slug'] for r in pj['related']] == ['my-first-draft-2'] and 'body' not in pj['related'][0])
 ok('preview still returns html', 'id=' in J(c, 'post', '/api/admin/preview', {'md': '## A & B'}, tok).json['html'])
+ok('images load lazily', '<img loading="lazy"' in A.render_post('![a](/uploads/x.webp)')[0])
 ok('toc unescapes titles', A.render_post('## Tom & Jerry <3')[1][0]['title'] == 'Tom & Jerry <3')
 
 # share pictures
-from PIL import Image
 r = anon.get(f'/og/{H}/card.png')
 ok('share card png 1200x630', r.status_code == 200 and r.mimetype == 'image/png' and Image.open(io.BytesIO(r.data)).size == (1200, 630))
 ok('story png 1080x1920', Image.open(io.BytesIO(anon.get(f'/og/{H}/story.png').data)).size == (1080, 1920))

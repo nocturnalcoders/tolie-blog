@@ -8,6 +8,10 @@ import { useDocumentTitle } from '../hooks.js';
 const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '' };
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
+function fileSize(bytes) {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
 // Put `text` between `s` and `t` as its own block, with a blank line on each side,
 // so an image never ends up glued to the middle of a sentence.
 function insertBlock(body, s, t, text) {
@@ -221,14 +225,16 @@ export default function Editor() {
         data.append('file', job.file);
         const res = await api('/api/admin/upload', { method: 'POST', form: data });
         swap(job.placeholder, `![${job.alt}](${res.url})`);
-        return null;
+        return { saved: [res.original_size, res.size] };
       } catch (err) {
         swap(job.placeholder, '');
-        return `${job.file.name}: ${err.message}`;
+        return { error: `${job.file.name}: ${err.message}` };
       }
     }));
-    const failed = results.filter(Boolean);
-    setMessage(failed.length ? '' : files.length > 1 ? `${files.length} images added.` : 'Image added.');
+    const failed = results.filter((r) => r.error).map((r) => r.error);
+    const [before, after] = results.reduce(([a, b], r) => (r.saved ? [a + r.saved[0], b + r.saved[1]] : [a, b]), [0, 0]);
+    const shrunk = after && after < before ? ` (${fileSize(before)} → ${fileSize(after)})` : '';
+    setMessage(failed.length ? '' : `${files.length > 1 ? `${files.length} images` : 'Image'} added${shrunk}.`);
     if (failed.length) setError(failed.join(' '));
   };
 

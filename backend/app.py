@@ -28,6 +28,7 @@ New comments can be announced on Telegram and/or by email (see .env.example).
 from __future__ import annotations
 
 import base64
+import io
 import hashlib
 import hmac
 import html as html_lib
@@ -54,6 +55,7 @@ import nh3
 import psycopg
 from flask import (Flask, Response, abort, g, jsonify, request,
                    send_from_directory, session)
+from PIL import Image, ImageOps
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -113,7 +115,9 @@ SMTP_USER = os.environ.get("BLOG_SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("BLOG_SMTP_PASSWORD", "")
 NOTIFY_EMAIL = os.environ.get("BLOG_NOTIFY_EMAIL", "")
 PER_PAGE = 8
-MAX_UPLOAD = 5 * 1024 * 1024
+MAX_UPLOAD = 15 * 1024 * 1024  # phone photos are big; they are shrunk on upload
+MAX_IMAGE_WIDTH = 1600
+MAX_IMAGE_PIXELS = 50_000_000
 REACTIONS = ("heart", "clap", "laugh", "wow")
 DUMMY_HASH = generate_password_hash(secrets.token_hex(8))
 
@@ -311,6 +315,7 @@ def render_post(text: str) -> tuple[str, list[dict]]:
             walk(t.get("children", []))
 
     walk(getattr(converter, "toc_tokens", []))
+    html = re.sub(r"<img(?![^>]*\bloading=)", '<img loading="lazy"', html)  # load pictures as they scroll in
     clean = nh3.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, url_schemes={"http", "https", "mailto"})
     return clean, toc
 
@@ -935,6 +940,28 @@ def sniff_image(data: bytes) -> str | None:
     return None
 
 
+def optimize_image(data: bytes, ext: str) -> tuple[bytes, str]:
+    """An upright, metadata-free (no GPS) WebP at most 1600px wide. Animations are kept as they are."""
+    img = Image.open(io.BytesIO(data))
+    if img.width * img.height > MAX_IMAGE_PIXELS:
+        raise ValueError("too many pixels")
+    if getattr(img, "is_animated", False):
+        return data, ext
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((MAX_IMAGE_WIDTH, MAX_IMAGE_WIDTH * 4), Image.LANCZOS)
+    alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
+    img = img.convert("RGBA" if alpha else "RGB")
+    out = io.BytesIO()
+    if ext == "png":  # screenshots and drawings: keep every pixel sharp
+        img.save(out, "WEBP", lossless=True, method=4)
+        if out.tell() > 1_000_000:  # really a photo saved as PNG
+            out = io.BytesIO()
+            img.save(out, "WEBP", quality=85, method=4)
+    else:
+        img.save(out, "WEBP", quality=82, method=4)
+    return out.getvalue(), "webp"
+
+
 @app.post("/api/admin/upload")
 @admin_required
 def admin_upload():
@@ -943,14 +970,18 @@ def admin_upload():
         return jsonify(error="No file received."), 400
     data = file.read(MAX_UPLOAD + 1)
     if len(data) > MAX_UPLOAD:
-        return jsonify(error="That file is too large (5 MB max)."), 413
+        return jsonify(error="That file is too large (15 MB max)."), 413
     ext = sniff_image(data)
     if ext is None:
         return jsonify(error="Only PNG, JPG, GIF, and WebP images are allowed."), 400
+    try:
+        out, ext = optimize_image(data, ext)
+    except Exception:
+        return jsonify(error="That image couldn't be read. Try saving it again as JPG or PNG."), 400
     name = f"{secrets.token_hex(8)}.{ext}"
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    (UPLOAD_DIR / name).write_bytes(data)
-    return jsonify(url=f"/uploads/{name}", name=name)
+    (UPLOAD_DIR / name).write_bytes(out)
+    return jsonify(url=f"/uploads/{name}", name=name, original_size=len(data), size=len(out))
 
 
 # --------------------------------------------------------------------------
@@ -1123,7 +1154,7 @@ def not_found(_exc):
 
 @app.errorhandler(413)
 def too_large(_exc):
-    return jsonify(error="That file is too large (5 MB max)."), 413
+    return jsonify(error="That file is too large (15 MB max)."), 413
 
 
 init_db()

@@ -153,6 +153,22 @@ describe('public pages', () => {
     expect(be.calls.some((c) => c.url === '/og/hello/story.png')).toBe(true);
   });
 
+  it('code blocks get a Copy button', async () => {
+    fakeBackend({
+      'GET /api/posts/hello': () => [200, {
+        post: { ...POSTS[0], status: 'published', html: '<div class="codehilite"><pre><span></span><code>print("hi")\n</code></pre></div>' },
+        prev: null, next: null,
+      }],
+    });
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    renderAt('/post/hello');
+    const btn = await screen.findByRole('button', { name: 'Copy' });
+    await userEvent.click(btn);
+    expect(writeText).toHaveBeenCalledWith('print("hi")');
+    expect(btn).toHaveTextContent('Copied');
+  });
+
   it('unknown post shows the not-found page', async () => {
     fakeBackend({ 'GET /api/posts/zzz': () => [404, { error: 'That note doesn’t exist, or it hasn’t been published yet.' }] });
     renderAt('/post/zzz');
@@ -296,7 +312,7 @@ describe('admin', () => {
     let n = 0;
     fakeBackend({
       'POST /api/admin/preview': () => [200, { html: '' }],
-      'POST /api/admin/upload': () => { n += 1; return [200, { url: `/uploads/${'a'.repeat(15)}${n}.png` }]; },
+      'POST /api/admin/upload': () => { n += 1; return [200, { url: `/uploads/${'a'.repeat(15)}${n}.png`, original_size: 4 * 1024 * 1024, size: 200 * 1024 }]; },
     }, { admin: true });
     renderAt('/admin/new');
     const body = await screen.findByLabelText('Write in Markdown');
@@ -312,7 +328,7 @@ describe('admin', () => {
     expect(body.value).toBe(
       `First paragraph.\n\n![my cat](/uploads/${'a'.repeat(15)}1.png)\n\n![beach day](/uploads/${'a'.repeat(15)}2.png)\n\nSecond sentence.`
     );
-    expect(await screen.findByRole('status')).toHaveTextContent('2 images added.');
+    expect(await screen.findByRole('status')).toHaveTextContent('2 images added (8.0 MB → 400 KB).');
   });
 
   it('editor rejects files that are not images', async () => {
