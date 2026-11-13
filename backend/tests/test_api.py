@@ -140,6 +140,25 @@ w = A.app.test_client()
 ok('same address capped (cleared cookies)', J(w, 'post', f'/api/posts/{H}/reactions', {'kind': 'wow'}, csrf(w)).status_code == 429)
 ok('reactions on draft 404', v.get(f'/api/posts/{slug}/reactions').status_code == 404)
 
+# traffic
+UA = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Safari/605.1'}
+def track(cl, path, ref='', ua=UA): return cl.post('/api/track', json={'path': path, 'referrer': ref}, headers=ua)
+ok('track view', track(v, f'/post/{H}', 'https://www.google.com/search?q=x').status_code == 204)
+track(v, f'/post/{H}')                                   # reload within 30s: not counted again
+track(v, '/', 'https://blog.example.test/post/x')       # own site is not a referrer
+track(anon, '/', '', {'User-Agent': 'Mozilla/5.0 (Macintosh) Chrome/130'})
+track(anon, '/', '', {'User-Agent': 'Googlebot/2.1'})    # bots ignored
+track(anon, '/admin', '', {'User-Agent': 'Mozilla/5.0 (Macintosh) Chrome/130'})  # admin pages ignored
+track(anon, f'/post/{slug}', '', {'User-Agent': 'Mozilla/5.0 (Macintosh) Chrome/130'})  # drafts ignored
+track(c, '/', '', {'User-Agent': 'Mozilla/5.0 (Macintosh) Chrome/130'})  # your own visits ignored
+ok('stats need admin', v.get('/api/admin/stats').status_code == 401)
+st = c.get('/api/admin/stats?days=7').json
+ok('stats totals', st['views'] == 3 and st['visitors'] == 2 and len(st['daily']) == 7 and st['daily'][-1]['views'] == 3)
+ok('stats top pages', st['pages'][0] == {'path': '/', 'title': None, 'views': 2, 'visitors': 2} and st['pages'][1]['title'] == 'Hello from the little town')
+ok('stats referrers + devices', st['referrers'] == [{'host': 'google.com', 'views': 1}] and {d['device']: d['views'] for d in st['devices']} == {'mobile': 2, 'desktop': 1})
+ok('stats counts comments + reactions', st['comments'] >= 1 and st['reactions'] >= 3)
+ok('stats bad range falls back to 30', c.get('/api/admin/stats?days=5').json['days'] == 30)
+
 # delete / logout / lockout
 ok('delete', J(c, 'delete', f'/api/admin/posts/{pid2}', None, tok).status_code == 200 and c.get(f'/api/posts/my-first-draft-2').status_code == 404)
 r = J(c, 'post', '/api/logout', None, tok); ok('logout', r.json['admin'] is False and c.get('/api/admin/posts').status_code == 401)

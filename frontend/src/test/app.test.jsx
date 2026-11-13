@@ -216,6 +216,77 @@ describe('admin', () => {
     expect(be.calls.find((c) => c.method === 'PUT').headers['X-CSRF-Token']).toBe('tok-123');
   });
 
+  it('traffic page shows totals, the daily chart and top pages', async () => {
+    const daily = Array.from({ length: 7 }, (_, i) => ({ day: `2026-11-0${i + 7}`, views: i, visitors: i ? 1 : 0 }));
+    const be = fakeBackend({
+      'GET /api/admin/stats': (url) => [200, {
+        days: url.includes('days=7') ? 7 : 30, daily, views: 21, visitors: 6, comments: 2, reactions: 5,
+        pages: [{ path: '/post/hello', title: 'Hello from the little town', views: 12, visitors: 4 }, { path: '/', title: null, views: 9, visitors: 5 }],
+        referrers: [{ host: 'google.com', views: 3 }],
+        devices: [{ device: 'mobile', views: 13 }, { device: 'desktop', views: 8 }],
+      }],
+    }, { admin: true });
+    renderAt('/admin/stats');
+    expect(await screen.findByText('Last 30 days')).toBeInTheDocument();
+    expect(screen.getByText('21')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Hello from the little town' })).toHaveAttribute('href', '/post/hello');
+    expect(screen.getByRole('link', { name: 'Home' })).toHaveAttribute('href', '/');
+    expect(screen.getByText('google.com')).toBeInTheDocument();
+    expect(screen.getByText('Phone / tablet')).toBeInTheDocument();
+    // the readout follows the focused day
+    screen.getByLabelText('9 Nov 2026: 2 views, 1 visitors').focus();
+    expect(await screen.findByText(/on 9 Nov 2026/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: '7 days' }));
+    expect(await screen.findByText('Last 7 days')).toBeInTheDocument();
+    expect(be.calls.some((c) => c.url === '/api/admin/stats?days=7')).toBe(true);
+  });
+
+  it('page views are reported for public pages but not admin pages', async () => {
+    const be = fakeBackend(publicRoutes);
+    renderAt('/');
+    await screen.findByRole('link', { name: 'Hello from the little town' });
+    const track = be.calls.filter((c) => c.url === '/api/track');
+    expect(track).toHaveLength(1);
+    expect(JSON.parse(track[0].body)).toMatchObject({ path: '/' });
+
+    const be2 = fakeBackend({}, { admin: true });
+    renderAt('/admin/comments');
+    await screen.findByRole('heading', { name: 'Comments' });
+    expect(be2.calls.some((c) => c.url === '/api/track')).toBe(false);
+  });
+
+  it('editor puts an uploaded image where the cursor is, on its own line', async () => {
+    let n = 0;
+    fakeBackend({
+      'POST /api/admin/preview': () => [200, { html: '' }],
+      'POST /api/admin/upload': () => { n += 1; return [200, { url: `/uploads/${'a'.repeat(15)}${n}.png` }]; },
+    }, { admin: true });
+    renderAt('/admin/new');
+    const body = await screen.findByLabelText('Write in Markdown');
+    await userEvent.type(body, 'First paragraph. Second sentence.');
+    // cursor right after "First paragraph."
+    body.focus();
+    body.setSelectionRange(16, 16);
+    await userEvent.upload(screen.getByLabelText('Choose an image'), [
+      new File(['x'], 'my-cat.png', { type: 'image/png' }),
+      new File(['y'], 'beach_day.jpg', { type: 'image/jpeg' }),
+    ]);
+    await waitFor(() => expect(body.value).not.toContain('Uploading'));
+    expect(body.value).toBe(
+      `First paragraph.\n\n![my cat](/uploads/${'a'.repeat(15)}1.png)\n\n![beach day](/uploads/${'a'.repeat(15)}2.png)\n\nSecond sentence.`
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent('2 images added.');
+  });
+
+  it('editor rejects files that are not images', async () => {
+    const be = fakeBackend({ 'POST /api/admin/preview': () => [200, { html: '' }] }, { admin: true });
+    renderAt('/admin/new');
+    await screen.findByLabelText('Write in Markdown');
+    await userEvent.upload(screen.getByLabelText('Choose an image'), new File(['x'], 'notes.pdf', { type: 'application/pdf' }), { applyAccept: false });
+    expect(await screen.findByRole('alert')).toHaveTextContent('Only PNG, JPG, GIF, and WebP');
+    expect(be.calls.some((c) => c.url === '/api/admin/upload')).toBe(false);
+  });
+
   it('editor refuses to save without a title', async () => {
     const be = fakeBackend({ 'POST /api/admin/preview': () => [200, { html: '' }] }, { admin: true });
     renderAt('/admin/new');

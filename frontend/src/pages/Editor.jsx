@@ -6,6 +6,19 @@ import { api } from '../api.js';
 import { useDocumentTitle } from '../hooks.js';
 
 const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '' };
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+// Put `text` between `s` and `t` as its own block, with a blank line on each side,
+// so an image never ends up glued to the middle of a sentence.
+function insertBlock(body, s, t, text) {
+  const before = body.slice(0, s);
+  const after = body.slice(t).replace(/^[ \t]+/, '');
+  const gap = (side) => (side.endsWith('\n\n') || side === '' ? '' : side.endsWith('\n') ? '\n' : '\n\n');
+  const pre = gap(before);
+  const post = after === '' ? '\n' : after.startsWith('\n\n') ? '' : after.startsWith('\n') ? '\n' : '\n\n';
+  const head = before + pre + text + post;
+  return { body: head + after, caret: head.length };
+}
 
 export default function Editor() {
   const { id } = useParams();
@@ -23,6 +36,8 @@ export default function Editor() {
   const [saving, setSaving] = useState(false);
   const bodyRef = useRef(null);
   const fileRef = useRef(null);
+  const caretRef = useRef(null); // where the cursor was last, since opening the file picker can lose it
+  const [dropping, setDropping] = useState(false);
   useDocumentTitle(`${isNew ? 'New note' : 'Edit note'} · tolie.space notes`);
 
   // Load the post when editing.
@@ -149,29 +164,101 @@ export default function Editor() {
     }
   };
 
+  const rememberCaret = (e) => {
+    caretRef.current = [e.target.selectionStart, e.target.selectionEnd];
+  };
+
+  // Upload images and drop them in where the cursor is. A placeholder holds the spot
+  // while uploading, so you can keep typing and the image still lands in the right place.
+  const uploadImages = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    const bad = files.find((f) => !IMAGE_TYPES.includes(f.type));
+    if (bad) {
+      setError('Only PNG, JPG, GIF, and WebP images are allowed.');
+      return;
+    }
+    const jobs = files.map((file) => {
+      const alt = file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').replace(/[[\]]/g, '');
+      const tag = Math.random().toString(36).slice(2, 8);
+      return { file, alt, placeholder: `![Uploading ${alt}…](#uploading-${tag})` };
+    });
+    const ta = bodyRef.current;
+    const live = ta && document.activeElement === ta ? [ta.selectionStart, ta.selectionEnd] : null;
+    const [s, t] = live || caretRef.current || [form.body.length, form.body.length];
+    const next = insertBlock(form.body, s, t, jobs.map((j) => j.placeholder).join('\n\n'));
+    setForm((f) => ({ ...f, body: next.body }));
+    setDirty(true);
+    caretRef.current = [next.caret, next.caret];
+    requestAnimationFrame(() => {
+      if (!ta) return;
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = next.caret;
+    });
+
+    // Swap a placeholder for its final text without throwing the cursor to the end.
+    const swap = (placeholder, text) => {
+      const el = bodyRef.current;
+      const focused = el && document.activeElement === el;
+      const sel = focused ? [el.selectionStart, el.selectionEnd] : null;
+      let at = -1;
+      setForm((f) => {
+        at = f.body.indexOf(placeholder);
+        return at < 0 ? f : { ...f, body: f.body.slice(0, at) + text + f.body.slice(at + placeholder.length) };
+      });
+      requestAnimationFrame(() => {
+        if (!sel || at < 0) return;
+        const shift = (pos) => (pos > at ? pos + text.length - placeholder.length : pos);
+        el.setSelectionRange(shift(sel[0]), shift(sel[1]));
+      });
+    };
+
+    setMessage(files.length > 1 ? `Uploading ${files.length} images…` : 'Uploading…');
+    setError('');
+    const results = await Promise.all(jobs.map(async (job) => {
+      try {
+        const data = new FormData();
+        data.append('file', job.file);
+        const res = await api('/api/admin/upload', { method: 'POST', form: data });
+        swap(job.placeholder, `![${job.alt}](${res.url})`);
+        return null;
+      } catch (err) {
+        swap(job.placeholder, '');
+        return `${job.file.name}: ${err.message}`;
+      }
+    }));
+    const failed = results.filter(Boolean);
+    setMessage(failed.length ? '' : files.length > 1 ? `${files.length} images added.` : 'Image added.');
+    if (failed.length) setError(failed.join(' '));
+  };
+
   const onPickImage = async (e) => {
     const input = e.target;
-    const file = input.files && input.files[0];
-    if (!file) return;
-    setMessage('Uploading…');
-    setError('');
-    try {
-      const data = new FormData();
-      data.append('file', file);
-      const res = await api('/api/admin/upload', { method: 'POST', form: data });
-      const alt = file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ');
-      const snippet = `![${alt}](${res.url})`;
-      const ta = bodyRef.current;
-      const s = ta ? ta.selectionStart : form.body.length;
-      const t = ta ? ta.selectionEnd : s;
-      setForm((f) => ({ ...f, body: f.body.slice(0, s) + snippet + f.body.slice(t) }));
-      setDirty(true);
-      setMessage('Image added.');
-    } catch (err) {
-      setMessage('');
-      setError(err.message);
-    }
+    const files = Array.from(input.files || []);
     input.value = '';
+    await uploadImages(files);
+  };
+
+  const hasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+
+  const onBodyDragOver = (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    setDropping(true);
+  };
+
+  const onBodyDrop = (e) => {
+    setDropping(false);
+    if (!hasFiles(e) || e.dataTransfer.files.length === 0) return;
+    e.preventDefault();
+    uploadImages(e.dataTransfer.files);
+  };
+
+  const onBodyPaste = (e) => {
+    const files = Array.from(e.clipboardData?.files || []).filter((f) => IMAGE_TYPES.includes(f.type));
+    if (files.length === 0) return;
+    e.preventDefault();
+    uploadImages(files);
   };
 
   const remove = async () => {
@@ -220,12 +307,29 @@ export default function Editor() {
           <div className="label-row">
             <label htmlFor="body">Write in Markdown</label>
             <span className="tools">
-              <button className="link" type="button" onClick={() => fileRef.current && fileRef.current.click()}>Add image</button>
-              <input ref={fileRef} className="sr" type="file" aria-label="Choose an image" accept="image/png,image/jpeg,image/gif,image/webp" onChange={onPickImage} />
+              <button className="link" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => fileRef.current && fileRef.current.click()}>Add image</button>
+              <input ref={fileRef} className="sr" type="file" multiple aria-label="Choose an image" accept={IMAGE_TYPES.join(',')} onChange={onPickImage} />
               <span className="muted">{words} {words === 1 ? 'word' : 'words'}</span>
             </span>
           </div>
-          <textarea id="body" ref={bodyRef} rows={18} spellCheck value={form.body} onChange={change('body')} onKeyDown={onBodyKeyDown} />
+          <textarea
+            id="body"
+            ref={bodyRef}
+            rows={18}
+            spellCheck
+            className={dropping ? 'dropping' : undefined}
+            aria-describedby="body-hint"
+            value={form.body}
+            onChange={change('body')}
+            onKeyDown={onBodyKeyDown}
+            onSelect={rememberCaret}
+            onBlur={rememberCaret}
+            onDragOver={onBodyDragOver}
+            onDragLeave={() => setDropping(false)}
+            onDrop={onBodyDrop}
+            onPaste={onBodyPaste}
+          />
+          <p id="body-hint" className="muted hint">Images go where the cursor is. You can also drag them in or paste them.</p>
 
           <div className="row">
             {status === 'published' ? (

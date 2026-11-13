@@ -43,27 +43,29 @@ export default function Moderation() {
       {error && <p className="flash err" role="alert">{error.message}</p>}
       <div className="card table-card">
         <span className="tab">{status === 'pending' ? 'Waiting for you' : 'Approved'}</span>
-        <table className="posts">
-          <thead>
-            <tr><th>Comment</th><th>On</th><th>Date</th><th><span className="sr">Actions</span></th></tr>
-          </thead>
-          <tbody>
-            {comments.map((c) => (
-              <tr key={c.id}>
-                <td><b>{c.author}</b><p className="comment-body">{c.body}</p></td>
-                <td><Link to={`/post/${c.post_slug}`}>{c.post_title}</Link></td>
-                <td>{formatDate(c.date)}</td>
-                <td className="acts">
-                  {c.status === 'pending' && <button className="link" type="button" onClick={() => act(c, 'PUT', 'Comment approved.')}>Approve</button>}
-                  <button className="link danger" type="button" onClick={() => act(c, 'DELETE', 'Comment deleted.')}>Delete</button>
-                </td>
-              </tr>
-            ))}
-            {!loading && comments.length === 0 && (
-              <tr><td colSpan={4}>{status === 'pending' ? 'Nothing waiting. All caught up.' : 'No approved comments yet.'}</td></tr>
-            )}
-          </tbody>
-        </table>
+        <div className="table-scroll">
+          <table className="posts">
+            <thead>
+              <tr><th>Comment</th><th>On</th><th>Date</th><th><span className="sr">Actions</span></th></tr>
+            </thead>
+            <tbody>
+              {comments.map((c) => (
+                <tr key={c.id}>
+                  <td><b>{c.author}</b><p className="comment-body">{c.body}</p></td>
+                  <td><Link to={`/post/${c.post_slug}`}>{c.post_title}</Link></td>
+                  <td>{formatDate(c.date)}</td>
+                  <td className="acts">
+                    {c.status === 'pending' && <button className="link" type="button" onClick={() => act(c, 'PUT', 'Comment approved.')}>Approve</button>}
+                    <button className="link danger" type="button" onClick={() => act(c, 'DELETE', 'Comment deleted.')}>Delete</button>
+                  </td>
+                </tr>
+              ))}
+              {!loading && comments.length === 0 && (
+                <tr><td colSpan={4}>{status === 'pending' ? 'Nothing waiting. All caught up.' : 'No approved comments yet.'}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </Layout>
   );

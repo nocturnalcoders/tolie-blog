@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 
 // GET a JSON endpoint. Change `path` (or bump `reloadKey`) to fetch again.
 export function useApi(path, reloadKey = 0) {
@@ -30,6 +31,28 @@ export function useApi(path, reloadKey = 0) {
   }, [path, reloadKey]);
 
   return state;
+}
+
+// Count a page view on every route change. The outside referrer only belongs to the first one.
+export function usePageViews() {
+  const { pathname } = useLocation();
+  const first = useRef(true);
+  useEffect(() => {
+    if (pathname.startsWith('/admin')) return;
+    const referrer = first.current ? document.referrer : '';
+    first.current = false;
+    try {
+      fetch('/api/track', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: pathname, referrer }),
+        credentials: 'same-origin',
+        keepalive: true,
+      }).catch(() => {});
+    } catch {
+      /* tracking must never break the page */
+    }
+  }, [pathname]);
 }
 
 export function useDocumentTitle(title) {

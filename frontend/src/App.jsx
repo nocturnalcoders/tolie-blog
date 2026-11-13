@@ -8,6 +8,8 @@ import Dashboard from './pages/Dashboard.jsx';
 import Editor from './pages/Editor.jsx';
 import Moderation from './pages/Moderation.jsx';
 import NotFound from './pages/NotFound.jsx';
+import Stats from './pages/Stats.jsx';
+import { usePageViews } from './hooks.js';
 
 function RequireAdmin({ children }) {
   const { ready, admin } = useAuth();
@@ -26,6 +28,7 @@ function RequireAdmin({ children }) {
 }
 
 export default function App() {
+  usePageViews();
   return (
     <Routes>
       <Route path="/" element={<Home />} />
@@ -34,6 +37,7 @@ export default function App() {
       <Route path="/admin/login" element={<Login />} />
       <Route path="/admin" element={<RequireAdmin><Dashboard /></RequireAdmin>} />
       <Route path="/admin/comments" element={<RequireAdmin><Moderation /></RequireAdmin>} />
+      <Route path="/admin/stats" element={<RequireAdmin><Stats /></RequireAdmin>} />
       <Route path="/admin/new" element={<RequireAdmin><Editor /></RequireAdmin>} />
       <Route path="/admin/edit/:id" element={<RequireAdmin><Editor /></RequireAdmin>} />
       <Route path="*" element={<NotFound />} />

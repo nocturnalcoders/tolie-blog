@@ -7,6 +7,7 @@ The React frontend (../frontend) talks to this API. Public routes:
   GET  /api/posts/<slug>             one post (rendered HTML)
   GET/POST /api/posts/<slug>/comments    approved comments / leave one (held for review)
   GET/POST /api/posts/<slug>/reactions   reaction counts / toggle one
+  POST /api/track                    count a page view (no cookies, no raw IPs stored)
   GET  /feed.xml  /sitemap.xml  /robots.txt  /healthz  /uploads/<file>
   GET  /post/<slug>                  the React shell with SEO meta tags filled in
 
@@ -18,12 +19,14 @@ Admin routes need a signed-in session and a CSRF header:
   GET/PUT/DELETE /api/admin/posts/<id>
   POST /api/admin/preview  POST /api/admin/upload
   GET  /api/admin/comments?status=   PUT/DELETE /api/admin/comments/<id>
+  GET  /api/admin/stats?days=7|30|90 traffic summary
 
 Configuration comes from environment variables (docker-compose.yml sets them).
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import html as html_lib
 import os
@@ -35,6 +38,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.utils import formatdate
 from functools import wraps
+from urllib.parse import urlsplit
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -153,6 +157,17 @@ CREATE TABLE IF NOT EXISTS reactions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (post_id, kind, voter)
 );
+CREATE TABLE IF NOT EXISTS page_views (
+  id         BIGSERIAL PRIMARY KEY,
+  path       TEXT NOT NULL,
+  post_id    BIGINT REFERENCES posts (id) ON DELETE SET NULL,
+  visitor    TEXT NOT NULL,
+  referrer   TEXT NOT NULL DEFAULT '',
+  device     TEXT NOT NULL DEFAULT 'desktop',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_views_time ON page_views (created_at);
+CREATE INDEX IF NOT EXISTS idx_views_visitor ON page_views (visitor, path, created_at);
 """
 
 SEED_BODY = """This is the first note on the blog. It is written in Markdown, stored in PostgreSQL,
@@ -603,6 +618,61 @@ def api_react(slug: str):
 
 
 # --------------------------------------------------------------------------
+# Traffic. A visitor is a hash of (secret, day, IP, browser), so nothing that
+# identifies a person is stored and the same person can't be followed across days.
+# --------------------------------------------------------------------------
+BOT_RE = re.compile(r"bot|crawl|spider|slurp|preview|fetch|curl|wget|python|httpclient|headless|lighthouse|monitor",
+                    re.I)
+MOBILE_RE = re.compile(r"mobile|android|iphone|ipod|ipad|tablet", re.I)
+VIEW_KEEP_DAYS = 400
+
+
+def visitor_hash() -> str:
+    raw = f"{app.secret_key}|{datetime.now(timezone.utc).date().isoformat()}|{request.remote_addr}|{request.user_agent.string}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def referrer_host(raw: str) -> str:
+    try:
+        host = (urlsplit(raw).hostname or "").lower()
+    except ValueError:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    own = (urlsplit(SITE_URL).hostname or "").lower()
+    return "" if not host or host in (own, request.host.split(":")[0].lower()) else host[:100]
+
+
+@app.post("/api/track")
+def api_track():
+    ua = request.user_agent.string or ""
+    payload = request.get_json(silent=True) or {}
+    path = str(payload.get("path", ""))[:200]
+    if is_admin() or not ua or BOT_RE.search(ua) or not path.startswith("/") or path.startswith(("/admin", "//")):
+        return "", 204
+    visitor = visitor_hash()
+    recent = db().execute(  # a reload or double fire within 30 seconds is one view
+        "SELECT 1 FROM page_views WHERE visitor = %s AND path = %s AND created_at > now() - interval '30 seconds'",
+        (visitor, path)).fetchone()
+    if recent:
+        return "", 204
+    post_id = None
+    m = re.fullmatch(r"/post/([^/?#]+)", path)
+    if m:
+        post_id = published_post_id(m.group(1))
+        if post_id is None:
+            return "", 204
+    db().execute(
+        "INSERT INTO page_views (path, post_id, visitor, referrer, device) VALUES (%s, %s, %s, %s, %s)",
+        (path, post_id, visitor, referrer_host(str(payload.get("referrer", ""))),
+         "mobile" if MOBILE_RE.search(ua) else "desktop"))
+    if secrets.randbelow(200) == 0:  # now and then, forget very old views
+        db().execute(f"DELETE FROM page_views WHERE created_at < now() - interval '{VIEW_KEEP_DAYS} days'")
+    db().commit()
+    return "", 204
+
+
+# --------------------------------------------------------------------------
 # Admin API
 # --------------------------------------------------------------------------
 @app.get("/api/admin/posts")
@@ -709,6 +779,40 @@ def admin_comment_delete(cid: int):
     db().execute("DELETE FROM comments WHERE id = %s", (cid,))
     db().commit()
     return jsonify(ok=True)
+
+
+@app.get("/api/admin/stats")
+@admin_required
+def admin_stats():
+    days = request.args.get("days", type=int) or 30
+    if days not in (7, 30, 90):
+        days = 30
+    since = "created_at >= date_trunc('day', now()) - make_interval(days => %s)"
+
+    def q(sql: str) -> list[dict]:
+        return db().execute(sql, (days - 1,)).fetchall()
+
+    series = [{"day": r["day"].isoformat(), "views": r["views"], "visitors": r["visitors"]} for r in q(
+        "SELECT d::date AS day, COUNT(v.id) AS views, COUNT(DISTINCT v.visitor) AS visitors"
+        " FROM generate_series(date_trunc('day', now()) - make_interval(days => %s), date_trunc('day', now()),"
+        " interval '1 day') AS d LEFT JOIN page_views v ON v.created_at >= d AND v.created_at < d + interval '1 day'"
+        " GROUP BY d ORDER BY d")]
+    pages = q(f"SELECT v.path, p.title, COUNT(*) AS views, COUNT(DISTINCT v.visitor) AS visitors"
+              f" FROM page_views v LEFT JOIN posts p ON p.id = v.post_id WHERE v.{since}"
+              f" GROUP BY v.path, p.title ORDER BY views DESC, v.path LIMIT 10")
+    refs = q(f"SELECT referrer, COUNT(*) AS views FROM page_views WHERE {since} AND referrer <> ''"
+             f" GROUP BY referrer ORDER BY views DESC, referrer LIMIT 10")
+    devices = q(f"SELECT device, COUNT(*) AS views FROM page_views WHERE {since} GROUP BY device ORDER BY views DESC")
+    counts = db().execute(
+        f"SELECT (SELECT COUNT(*) FROM comments WHERE {since}) AS comments,"
+        f" (SELECT COUNT(*) FROM reactions WHERE {since}) AS reactions", (days - 1, days - 1)).fetchone()
+    return jsonify(
+        days=days, daily=series,
+        views=sum(d["views"] for d in series), visitors=sum(d["visitors"] for d in series),
+        comments=counts["comments"], reactions=counts["reactions"],
+        pages=[{"path": r["path"], "title": r["title"], "views": r["views"], "visitors": r["visitors"]} for r in pages],
+        referrers=[{"host": r["referrer"], "views": r["views"]} for r in refs],
+        devices=[{"device": r["device"], "views": r["views"]} for r in devices])
 
 
 @app.post("/api/admin/preview")
