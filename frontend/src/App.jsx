@@ -6,6 +6,7 @@ import Post from './pages/Post.jsx';
 import Login from './pages/Login.jsx';
 import Dashboard from './pages/Dashboard.jsx';
 import Editor from './pages/Editor.jsx';
+import Moderation from './pages/Moderation.jsx';
 import NotFound from './pages/NotFound.jsx';
 
 function RequireAdmin({ children }) {
@@ -32,6 +33,7 @@ export default function App() {
       <Route path="/post/:slug" element={<Post />} />
       <Route path="/admin/login" element={<Login />} />
       <Route path="/admin" element={<RequireAdmin><Dashboard /></RequireAdmin>} />
+      <Route path="/admin/comments" element={<RequireAdmin><Moderation /></RequireAdmin>} />
       <Route path="/admin/new" element={<RequireAdmin><Editor /></RequireAdmin>} />
       <Route path="/admin/edit/:id" element={<RequireAdmin><Editor /></RequireAdmin>} />
       <Route path="*" element={<NotFound />} />

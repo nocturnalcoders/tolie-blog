@@ -1,6 +1,8 @@
 import { Link, useParams } from 'react-router-dom';
 import Layout from '../components/Layout.jsx';
 import Prose from '../components/Prose.jsx';
+import Reactions from '../components/Reactions.jsx';
+import Comments from '../components/Comments.jsx';
 import NotFound from './NotFound.jsx';
 import { useApi, useDocumentTitle } from '../hooks.js';
 import { formatDate } from '../utils.js';
@@ -37,6 +39,7 @@ export default function Post() {
             <span className="tab">{post.tags[0] || 'Note'}</span>
             <Prose html={post.html} />
           </article>
+          {post.status === 'published' && <Reactions key={`reactions-${post.slug}`} slug={post.slug} />}
           <aside className="card author">
             <img className="avatar" src="/avatar.jpg" width="72" height="72" alt="Ghibli-style portrait of Christianto Lie" />
             <p>
@@ -44,6 +47,7 @@ export default function Post() {
               Senior software engineer, futsal player, night walker. Come say hi in <a href="https://tolie.space">the little town</a>.
             </p>
           </aside>
+          {post.status === 'published' && <Comments key={`comments-${post.slug}`} slug={post.slug} />}
           <nav className="pager two" aria-label="More notes">
             {data.prev ? <Link className="btn" to={`/post/${data.prev.slug}`}>← {data.prev.title.length > 34 ? `${data.prev.title.slice(0, 33)}…` : data.prev.title}</Link> : <span />}
             {data.next && <Link className="btn" to={`/post/${data.next.slug}`}>{data.next.title.length > 34 ? `${data.next.title.slice(0, 33)}…` : data.next.title} →</Link>}

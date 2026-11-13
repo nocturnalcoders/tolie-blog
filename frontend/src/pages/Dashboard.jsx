@@ -12,6 +12,8 @@ export default function Dashboard() {
   const [reload, setReload] = useState(0);
   const [message, setMessage] = useState('');
   const { data, error, loading } = useApi('/api/admin/posts', reload);
+  const comments = useApi('/api/admin/comments');
+  const pending = comments.data ? comments.data.pending : 0;
   useDocumentTitle('Admin · tolie.space notes');
 
   const remove = async (post) => {
@@ -38,6 +40,7 @@ export default function Dashboard() {
         <h1>Your notes</h1>
         <div className="row">
           <Link className="btn" to="/admin/new">New note</Link>
+          <Link className="btn ghost" to="/admin/comments">Comments{pending > 0 ? ` (${pending} waiting)` : ''}</Link>
           <button className="ghost" type="button" onClick={signOut}>Sign out</button>
         </div>
       </section>

@@ -89,6 +89,36 @@ describe('public pages', () => {
     expect(screen.getByRole('link', { name: /Futsal and code reviews →/ })).toHaveAttribute('href', '/post/futsal');
   });
 
+  it('post page shows comments, holds a new one for review, and toggles a reaction', async () => {
+    const be = fakeBackend({
+      'GET /api/posts/hello': () => [200, { post: { ...POSTS[0], status: 'published', html: '<p>Body</p>' }, prev: null, next: null }],
+      'GET /api/posts/hello/comments': () => [200, { comments: [
+        { id: 1, author: 'Ana', body: 'Nice <b>post</b>', by_author: false, date: '2026-11-13T10:00:00Z' },
+        { id: 2, author: 'Christianto Lie', body: 'Thanks!', by_author: true, date: '2026-11-13T11:00:00Z' },
+      ] }],
+      'POST /api/posts/hello/comments': () => [201, { pending: true }],
+      'GET /api/posts/hello/reactions': () => [200, { counts: { heart: 2, clap: 0, laugh: 0, wow: 1 }, mine: [] }],
+      'POST /api/posts/hello/reactions': () => [200, { counts: { heart: 3, clap: 0, laugh: 0, wow: 1 }, mine: ['heart'] }],
+    });
+    renderAt('/post/hello');
+    expect(await screen.findByRole('heading', { name: '2 comments' })).toBeInTheDocument();
+    expect(screen.getByText('Nice <b>post</b>')).toBeInTheDocument(); // shown as text, never as HTML
+    expect(screen.getByText('author')).toBeInTheDocument();
+
+    const heart = await screen.findByRole('button', { name: 'Love it, 2' });
+    expect(heart).toHaveAttribute('aria-pressed', 'false');
+    await userEvent.click(heart);
+    expect(await screen.findByRole('button', { name: 'Love it, 3' })).toHaveAttribute('aria-pressed', 'true');
+
+    await userEvent.type(screen.getByLabelText('Name'), 'Budi');
+    await userEvent.type(screen.getByLabelText(/^Comment/), 'Great read');
+    await userEvent.click(screen.getByRole('button', { name: 'Post comment' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('once I’ve read it');
+    const sent = be.calls.find((c) => c.method === 'POST' && c.url === '/api/posts/hello/comments');
+    expect(sent.headers['X-CSRF-Token']).toBe('tok-123');
+    expect(JSON.parse(sent.body)).toEqual({ name: 'Budi', body: 'Great read', website: '' });
+  });
+
   it('unknown post shows the not-found page', async () => {
     fakeBackend({ 'GET /api/posts/zzz': () => [404, { error: 'That note doesn’t exist, or it hasn’t been published yet.' }] });
     renderAt('/post/zzz');
@@ -170,6 +200,20 @@ describe('admin', () => {
     expect(JSON.parse(save.body)).toMatchObject({ title: 'My note', body: 'Body text', action: 'publish' });
     // now editing the saved post: the primary button is "Save changes"
     expect(await screen.findByRole('button', { name: 'Save changes' })).toBeInTheDocument();
+  });
+
+  it('moderation page approves a waiting comment', async () => {
+    let comments = [{ id: 5, author: 'Ana', body: 'Hello!', by_author: false, date: '2026-11-13T10:00:00Z', status: 'pending', post_slug: 'hello', post_title: 'Hello from the little town' }];
+    const be = fakeBackend({
+      'GET /api/admin/comments': () => [200, { comments, pending: comments.length }],
+      'PUT /api/admin/comments/5': () => { comments = []; return [200, { ok: true }]; },
+    }, { admin: true });
+    renderAt('/admin/comments');
+    expect(await screen.findByRole('button', { name: 'Waiting (1)' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Hello from the little town' })).toHaveAttribute('href', '/post/hello');
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(await screen.findByText('Nothing waiting. All caught up.')).toBeInTheDocument();
+    expect(be.calls.find((c) => c.method === 'PUT').headers['X-CSRF-Token']).toBe('tok-123');
   });
 
   it('editor refuses to save without a title', async () => {

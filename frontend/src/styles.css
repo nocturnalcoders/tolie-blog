@@ -283,12 +283,13 @@ button.link.danger { color: #b3321f; }
 
 .prose { font-size: 19px; line-height: 1.8; overflow-wrap: break-word; }
 .prose > :first-child { margin-top: 0; }
-.prose h1, .prose h2, .prose h3, .prose h4 { margin: 1.7em 0 .5em; color: var(--ink); }
+.prose h1, .prose h2, .prose h3, .prose h4 { margin: 1.4em 0 .5em; color: var(--ink); }
 .prose h1 { font-size: 30px; }
 .prose h2 { font-size: 26px; }
 .prose h3 { font-size: 21px; }
 .prose a { color: var(--link); text-underline-offset: 3px; }
 .prose blockquote { margin: 1.4em 0; padding: 4px 0 4px 18px; border-left: 5px solid var(--amber); color: var(--ink-soft); font-style: italic; }
+.prose blockquote > :last-child, .prose li > :last-child { margin-bottom: 0; }
 .prose img { display: block; margin: 1.4em auto; border-radius: 12px; border: 3px solid var(--line); box-shadow: 0 5px 0 rgba(0, 0, 0, .2); }
 .prose code { font: 500 .88em ui-monospace, 'SF Mono', Menlo, Consolas, monospace; background: rgba(90, 59, 46, .12); padding: .1em .38em; border-radius: 6px; }
 .prose pre, .prose .codehilite { border-radius: 12px; }
@@ -306,6 +307,25 @@ button.link.danger { color: #b3321f; }
 
 .author { display: flex; align-items: center; gap: 18px; padding: 26px 24px 20px; }
 .author p { margin: 0; font-size: 16px; line-height: 1.6; }
+
+/* ---------- reactions and comments ---------- */
+.reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: -12px 0 0; }
+.react { padding: 6px 14px; gap: 6px; background: rgba(255, 244, 220, .1); color: var(--text); border: 2px solid rgba(255, 214, 150, .4); box-shadow: none; font-weight: 500; }
+.react:active { transform: translateY(1px); box-shadow: none; }
+.react:hover, .react.on { background: var(--amber); color: #3a2314; border-color: var(--clay); }
+[data-theme="day"] .react:not(.on):not(:hover) { background: rgba(255, 255, 255, .6); border-color: rgba(90, 59, 46, .4); }
+.reactions .note { margin: 0; }
+.comments h2 { font-size: 24px; margin-bottom: 10px; }
+.comment-list { list-style: none; padding: 0; margin: 0 0 8px; }
+.comment-list li { padding: 14px 0; border-bottom: 2px dashed #e2d3b6; }
+.comment-list li.by-author { border-left: 4px solid var(--amber); padding-left: 14px; }
+.comment-list .meta { margin: 0 0 4px; color: var(--ink-soft); }
+.comment-list .meta b { color: var(--ink); font-weight: 600; }
+.comment-list .badge { margin-left: 8px; }
+.comment-body { margin: 0; font-size: 16px; line-height: 1.65; white-space: pre-line; overflow-wrap: anywhere; }
+.comment-form textarea { font-family: var(--font-body); font-size: 16px; }
+.hp { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+.acts button + button { margin-left: 12px; }
 
 .empty { text-align: center; }
 .lost h1 { font-size: 30px; margin-bottom: 8px; }

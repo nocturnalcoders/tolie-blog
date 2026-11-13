@@ -5,6 +5,8 @@ The React frontend (../frontend) talks to this API. Public routes:
   GET  /api/posts?page=&q=&tag=      list published posts
   GET  /api/tags                     tags with counts
   GET  /api/posts/<slug>             one post (rendered HTML)
+  GET/POST /api/posts/<slug>/comments    approved comments / leave one (held for review)
+  GET/POST /api/posts/<slug>/reactions   reaction counts / toggle one
   GET  /feed.xml  /sitemap.xml  /robots.txt  /healthz  /uploads/<file>
   GET  /post/<slug>                  the React shell with SEO meta tags filled in
 
@@ -15,6 +17,7 @@ Admin routes need a signed-in session and a CSRF header:
   GET/POST /api/admin/posts          list / create
   GET/PUT/DELETE /api/admin/posts/<id>
   POST /api/admin/preview  POST /api/admin/upload
+  GET  /api/admin/comments?status=   PUT/DELETE /api/admin/comments/<id>
 
 Configuration comes from environment variables (docker-compose.yml sets them).
 """
@@ -89,6 +92,7 @@ SHELL_URL = os.environ.get("BLOG_SHELL_URL", "")  # e.g. http://web/index.html i
 COOKIE_SECURE = os.environ.get("BLOG_COOKIE_SECURE", "1") != "0"
 PER_PAGE = 8
 MAX_UPLOAD = 5 * 1024 * 1024
+REACTIONS = ("heart", "clap", "laugh", "wow")
 DUMMY_HASH = generate_password_hash(secrets.token_hex(8))
 
 if DB_SCHEMA and not re.fullmatch(r"[a-z0-9_]+", DB_SCHEMA):
@@ -128,6 +132,26 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   ip       TEXT PRIMARY KEY,
   attempts INTEGER NOT NULL,
   first_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comments (
+  id         BIGSERIAL PRIMARY KEY,
+  post_id    BIGINT NOT NULL REFERENCES posts (id) ON DELETE CASCADE,
+  author     TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  by_author  BOOLEAN NOT NULL DEFAULT false,
+  status     TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved')),
+  ip         TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_comments_post ON comments (post_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_comments_ip ON comments (ip, created_at);
+CREATE TABLE IF NOT EXISTS reactions (
+  post_id    BIGINT NOT NULL REFERENCES posts (id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL,
+  voter      TEXT NOT NULL,
+  ip         TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (post_id, kind, voter)
 );
 """
 
@@ -463,6 +487,122 @@ def api_post(slug: str):
 
 
 # --------------------------------------------------------------------------
+# Comments and reactions
+# --------------------------------------------------------------------------
+def published_post_id(slug: str) -> int | None:
+    row = db().execute("SELECT id FROM posts WHERE slug = %s AND status = 'published'", (slug,)).fetchone()
+    return row["id"] if row else None
+
+
+def comment_json(row: dict, admin: bool = False) -> dict:
+    data = {"id": row["id"], "author": row["author"], "body": row["body"],
+            "by_author": row["by_author"], "date": iso(row["created_at"])}
+    if admin:
+        data.update(status=row["status"], post_slug=row["slug"], post_title=row["title"])
+    return data
+
+
+@app.get("/api/posts/<slug>/comments")
+def api_comments(slug: str):
+    pid = published_post_id(slug)
+    if pid is None:
+        return jsonify(error="That note doesn't exist."), 404
+    rows = db().execute(
+        "SELECT * FROM comments WHERE post_id = %s AND status = 'approved' ORDER BY created_at, id",
+        (pid,)).fetchall()
+    resp = jsonify(comments=[comment_json(r) for r in rows])
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.post("/api/posts/<slug>/comments")
+def api_comment_create(slug: str):
+    check_csrf()
+    pid = published_post_id(slug)
+    if pid is None:
+        return jsonify(error="That note doesn't exist."), 404
+    payload = request.get_json(silent=True) or {}
+    if str(payload.get("website", "")).strip():  # honeypot: people never see this field, bots fill it
+        return jsonify(pending=True), 201
+    admin = is_admin()
+    author = "Christianto Lie" if admin else re.sub(r"\s+", " ", str(payload.get("name", ""))).strip()
+    body = str(payload.get("body", "")).replace("\r\n", "\n").strip()
+    if not author or len(author) > 60:
+        return jsonify(error="Add your name (60 characters at most)."), 400
+    if len(body) < 2 or len(body) > 3000:
+        return jsonify(error="Write a comment between 2 and 3000 characters."), 400
+    ip = request.remote_addr or "?"
+    if not admin:
+        recent = db().execute(
+            "SELECT COUNT(*) AS n FROM comments"
+            " WHERE ip = %s AND NOT by_author AND created_at > now() - interval '10 minutes'",
+            (ip,)).fetchone()["n"]
+        if recent >= 3:
+            return jsonify(error="You've left a few comments already. Try again in a few minutes."), 429
+    row = db().execute(
+        "INSERT INTO comments (post_id, author, body, by_author, status, ip) VALUES (%s, %s, %s, %s, %s, %s)"
+        " RETURNING *",
+        (pid, author, body, admin, "approved" if admin else "pending", ip)).fetchone()
+    db().commit()
+    if admin:
+        return jsonify(pending=False, comment=comment_json(row)), 201
+    return jsonify(pending=True), 201
+
+
+def voter_id() -> str:
+    if "voter" not in session:
+        session["voter"] = secrets.token_urlsafe(16)
+        session.permanent = True
+    return session["voter"]
+
+
+def reaction_state(pid: int) -> dict:
+    rows = db().execute("SELECT kind, COUNT(*) AS n FROM reactions WHERE post_id = %s GROUP BY kind",
+                        (pid,)).fetchall()
+    counts = {k: 0 for k in REACTIONS}
+    counts.update({r["kind"]: r["n"] for r in rows if r["kind"] in counts})
+    mine = [r["kind"] for r in db().execute(
+        "SELECT kind FROM reactions WHERE post_id = %s AND voter = %s", (pid, session.get("voter", ""))).fetchall()]
+    return {"counts": counts, "mine": mine}
+
+
+@app.get("/api/posts/<slug>/reactions")
+def api_reactions(slug: str):
+    pid = published_post_id(slug)
+    if pid is None:
+        return jsonify(error="That note doesn't exist."), 404
+    resp = jsonify(reaction_state(pid))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.post("/api/posts/<slug>/reactions")
+def api_react(slug: str):
+    check_csrf()
+    pid = published_post_id(slug)
+    if pid is None:
+        return jsonify(error="That note doesn't exist."), 404
+    kind = str((request.get_json(silent=True) or {}).get("kind", ""))
+    if kind not in REACTIONS:
+        return jsonify(error="Unknown reaction."), 400
+    voter, ip = voter_id(), request.remote_addr or "?"
+    removed = db().execute("DELETE FROM reactions WHERE post_id = %s AND kind = %s AND voter = %s",
+                           (pid, kind, voter)).rowcount
+    if not removed:
+        # Clearing cookies gives a new voter id, so also cap how often one address can add the same reaction.
+        same_ip = db().execute("SELECT COUNT(*) AS n FROM reactions WHERE post_id = %s AND kind = %s AND ip = %s",
+                               (pid, kind, ip)).fetchone()["n"]
+        if same_ip >= 3:
+            return jsonify(error="That reaction has already been counted from here."), 429
+        db().execute("INSERT INTO reactions (post_id, kind, voter, ip) VALUES (%s, %s, %s, %s)"
+                     " ON CONFLICT DO NOTHING", (pid, kind, voter, ip))
+    db().commit()
+    resp = jsonify(reaction_state(pid))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# --------------------------------------------------------------------------
 # Admin API
 # --------------------------------------------------------------------------
 @app.get("/api/admin/posts")
@@ -536,6 +676,37 @@ def admin_save(pid: int | None = None):
 @admin_required
 def admin_delete(pid: int):
     db().execute("DELETE FROM posts WHERE id = %s", (pid,))
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/admin/comments")
+@admin_required
+def admin_comments():
+    status = request.args.get("status", "pending")
+    if status not in ("pending", "approved"):
+        status = "pending"
+    rows = db().execute(
+        "SELECT c.*, p.slug, p.title FROM comments c JOIN posts p ON p.id = c.post_id"
+        " WHERE c.status = %s ORDER BY c.created_at DESC, c.id DESC LIMIT 200", (status,)).fetchall()
+    pending = db().execute("SELECT COUNT(*) AS n FROM comments WHERE status = 'pending'").fetchone()["n"]
+    return jsonify(comments=[comment_json(r, admin=True) for r in rows], pending=pending)
+
+
+@app.put("/api/admin/comments/<int:cid>")
+@admin_required
+def admin_comment_approve(cid: int):
+    row = db().execute("UPDATE comments SET status = 'approved' WHERE id = %s RETURNING id", (cid,)).fetchone()
+    db().commit()
+    if row is None:
+        return jsonify(error="Comment not found."), 404
+    return jsonify(ok=True)
+
+
+@app.delete("/api/admin/comments/<int:cid>")
+@admin_required
+def admin_comment_delete(cid: int):
+    db().execute("DELETE FROM comments WHERE id = %s", (cid,))
     db().commit()
     return jsonify(ok=True)
 

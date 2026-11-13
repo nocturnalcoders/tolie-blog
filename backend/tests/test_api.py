@@ -102,6 +102,44 @@ ok('svg rejected', c.post('/api/admin/upload', data={'file': (io.BytesIO(b'<svg 
 ok('oversize rejected', c.post('/api/admin/upload', data={'file': (io.BytesIO(png + b'0' * (5 * 1024 * 1024)), 'b.png')}, headers={'X-CSRF-Token': tok}, content_type='multipart/form-data').status_code in (400, 413))
 ok('upload traversal blocked', c.get('/uploads/..%2fblog.db').status_code == 404 and c.get('/uploads/evil.png').status_code == 404)
 
+# comments + moderation
+H = 'hello-from-the-little-town'
+v = A.app.test_client(); vt = csrf(v)
+ok('comment needs csrf', v.post(f'/api/posts/{H}/comments', json={'name': 'Ana', 'body': 'Hi'}).status_code == 400)
+ok('comment validates', J(v, 'post', f'/api/posts/{H}/comments', {'name': ' ', 'body': 'Hi there'}, vt).status_code == 400 and J(v, 'post', f'/api/posts/{H}/comments', {'name': 'Ana', 'body': 'x'}, vt).status_code == 400)
+ok('comment on draft 404', J(v, 'post', f'/api/posts/{slug}/comments', {'name': 'Ana', 'body': 'Hi there'}, vt).status_code == 404)
+r = J(v, 'post', f'/api/posts/{H}/comments', {'name': 'Ana', 'body': '<script>alert(1)</script> nice post'}, vt)
+ok('comment held for review', r.status_code == 201 and r.json['pending'] is True and v.get(f'/api/posts/{H}/comments').json['comments'] == [])
+ok('honeypot pretends success but saves nothing', J(v, 'post', f'/api/posts/{H}/comments', {'name': 'Bot', 'body': 'buy now', 'website': 'spam.example'}, vt).json['pending'] is True)
+ok('moderation needs admin', v.get('/api/admin/comments').status_code == 401 and J(v, 'put', '/api/admin/comments/1', None, vt).status_code == 401)
+q = c.get('/api/admin/comments').json
+ok('admin sees pending', q['pending'] == 1 and len(q['comments']) == 1 and q['comments'][0]['post_slug'] == H)
+cid = q['comments'][0]['id']
+ok('approve', J(c, 'put', f'/api/admin/comments/{cid}', None, tok).status_code == 200 and c.get('/api/admin/comments').json['pending'] == 0)
+pub = v.get(f'/api/posts/{H}/comments').json['comments']
+ok('approved is public, body kept as plain text, no ip', len(pub) == 1 and pub[0]['body'].startswith('<script>') and 'ip' not in pub[0] and 'status' not in pub[0])
+r = J(c, 'post', f'/api/posts/{H}/comments', {'name': 'Someone', 'body': 'Thanks Ana!'}, tok)
+ok('author reply is approved and marked', r.json['pending'] is False and r.json['comment']['by_author'] is True and r.json['comment']['author'] == 'Christianto Lie')
+ok('3 comments per 10 minutes', all(J(v, 'post', f'/api/posts/{H}/comments', {'name': 'Ana', 'body': b}, vt).status_code == 201 for b in ('second', 'third')))
+ok('comment rate limit', J(v, 'post', f'/api/posts/{H}/comments', {'name': 'Ana', 'body': 'fourth'}, vt).status_code == 429)
+pend = [x['id'] for x in c.get('/api/admin/comments').json['comments']]
+ok('delete comment', len(pend) == 2 and all(J(c, 'delete', f'/api/admin/comments/{i}', None, tok).status_code == 200 for i in pend) and c.get('/api/admin/comments').json['pending'] == 0)
+ok('approve missing 404', J(c, 'put', '/api/admin/comments/99999', None, tok).status_code == 404)
+
+# reactions
+ok('reactions start at zero', v.get(f'/api/posts/{H}/reactions').json == {'counts': {'heart': 0, 'clap': 0, 'laugh': 0, 'wow': 0}, 'mine': []})
+ok('reaction needs csrf + known kind', v.post(f'/api/posts/{H}/reactions', json={'kind': 'heart'}).status_code == 400 and J(v, 'post', f'/api/posts/{H}/reactions', {'kind': 'poop'}, vt).status_code == 400)
+r = J(v, 'post', f'/api/posts/{H}/reactions', {'kind': 'heart'}, vt)
+ok('react', r.status_code == 200 and r.json['counts']['heart'] == 1 and r.json['mine'] == ['heart'])
+ok('other visitor sees count, not as theirs', anon.get(f'/api/posts/{H}/reactions').json['counts']['heart'] == 1 and anon.get(f'/api/posts/{H}/reactions').json['mine'] == [])
+r = J(v, 'post', f'/api/posts/{H}/reactions', {'kind': 'heart'}, vt)
+ok('react again toggles off', r.json['counts']['heart'] == 0 and r.json['mine'] == [])
+for _ in range(3):
+    w = A.app.test_client(); J(w, 'post', f'/api/posts/{H}/reactions', {'kind': 'wow'}, csrf(w))
+w = A.app.test_client()
+ok('same address capped (cleared cookies)', J(w, 'post', f'/api/posts/{H}/reactions', {'kind': 'wow'}, csrf(w)).status_code == 429)
+ok('reactions on draft 404', v.get(f'/api/posts/{slug}/reactions').status_code == 404)
+
 # delete / logout / lockout
 ok('delete', J(c, 'delete', f'/api/admin/posts/{pid2}', None, tok).status_code == 200 and c.get(f'/api/posts/my-first-draft-2').status_code == 404)
 r = J(c, 'post', '/api/logout', None, tok); ok('logout', r.json['admin'] is False and c.get('/api/admin/posts').status_code == 401)
