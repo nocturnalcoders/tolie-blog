@@ -5,6 +5,8 @@ import PostCard from '../components/PostCard.jsx';
 import Pager from '../components/Pager.jsx';
 import { useApi, useDocumentTitle } from '../hooks.js';
 
+const TOP_TAGS = 12;
+
 export default function Home() {
   const { tag } = useParams();
   const [params, setParams] = useSearchParams();
@@ -16,7 +18,7 @@ export default function Home() {
   if (tag) qs.set('tag', tag);
   if (page > 1) qs.set('page', String(page));
   const list = useApi(`/api/posts?${qs.toString()}`);
-  const tags = useApi('/api/tags');
+  const tags = useApi(`/api/tags?limit=${TOP_TAGS}`);
 
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
@@ -33,6 +35,10 @@ export default function Home() {
   };
 
   const posts = list.data ? list.data.posts : [];
+  // Only the most used tags fit here; the open tag stays visible even when it isn't one of them.
+  const topTags = tags.data ? tags.data.tags : [];
+  const shownTags = tag && tags.data && !topTags.some((t) => t.tag === tag) ? [...topTags, { tag, count: null }] : topTags;
+  const totalTags = tags.data ? tags.data.total || topTags.length : 0;
 
   return (
     <Layout>
@@ -50,13 +56,16 @@ export default function Home() {
         <button type="submit">Search</button>
       </form>
 
-      {tags.data && tags.data.tags.length > 0 && (
+      {shownTags.length > 0 && (
         <ul className="taglist" aria-label="Tags">
-          {tags.data.tags.map(({ tag: t, count }) => (
+          {shownTags.map(({ tag: t, count }) => (
             <li key={t}>
-              <Link className={`chip${t === tag ? ' on' : ''}`} to={`/tag/${t}`}>#{t} <b>{count}</b></Link>
+              <Link className={`chip${t === tag ? ' on' : ''}`} to={`/tag/${t}`}>#{t}{count !== null && <> <b>{count}</b></>}</Link>
             </li>
           ))}
+          {totalTags > topTags.length && (
+            <li><Link className="chip more" to="/tags">All {totalTags} tags →</Link></li>
+          )}
         </ul>
       )}
 

@@ -58,6 +58,51 @@ describe('public pages', () => {
     expect(within(tagList).getByRole('link', { name: /#futsal/ })).toHaveAttribute('href', '/tag/futsal');
   });
 
+  it('home shows only the most used tags, with a link to all of them', async () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ tag: `t${i}`, count: 20 - i }));
+    const be = fakeBackend({ ...publicRoutes, 'GET /api/tags': () => [200, { tags: many, total: 340 }] });
+    renderAt('/tag/rare-one');
+    const list = await screen.findByRole('list', { name: 'Tags' });
+    expect(within(list).getAllByRole('link')).toHaveLength(14); // 12 + the open tag + "All tags"
+    expect(within(list).getByRole('link', { name: '#rare-one' })).toHaveClass('on');
+    expect(within(list).getByRole('link', { name: 'All 340 tags →' })).toHaveAttribute('href', '/tags');
+    expect(be.calls.some((c) => c.url === '/api/tags?limit=12')).toBe(true);
+  });
+
+  it('tags page shows one segment at a time, with search across all tags', async () => {
+    const many = Array.from({ length: 75 }, (_, i) => ({ tag: `p${i}`, count: 1 }));
+    fakeBackend({ 'GET /api/tags': () => [200, { tags: [
+      { tag: 'python', count: 9 }, { tag: 'anime', count: 8 }, { tag: 'futsal', count: 7 }, { tag: 'pydantic', count: 6 }, { tag: '3d', count: 5 }, ...many,
+    ], total: 80 }] });
+    renderAt('/tags');
+    expect(await screen.findByText('80 tags across the notes.')).toBeInTheDocument();
+    const bar = screen.getByRole('navigation', { name: 'Tags by letter' });
+    expect(within(bar).getAllByRole('button').map((b) => b.textContent)).toEqual(['Popular', '#', 'A', 'F', 'P']);
+    // Popular: the 30 most used, in that order
+    expect(within(bar).getByRole('button', { name: 'Popular tags' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getAllByRole('link', { name: /^#/ }).slice(0, 2).map((l) => l.textContent)).toEqual(['#python 9', '#anime 8']);
+    expect(screen.getAllByRole('link', { name: /^#/ })).toHaveLength(30);
+
+    // one letter: A to Z inside, 60 at a time
+    await userEvent.click(within(bar).getByRole('button', { name: 'Tags starting with P' }));
+    expect(screen.queryByRole('link', { name: /anime/ })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('link', { name: /^#p/ })).toHaveLength(60);
+    expect(screen.getAllByRole('link', { name: /^#p/ }).slice(0, 3).map((l) => l.textContent)).toEqual(['#p0 1', '#p1 1', '#p2 1']);
+    await userEvent.click(screen.getByRole('button', { name: 'Show more (17 left)' }));
+    expect(screen.getAllByRole('link', { name: /^#p/ })).toHaveLength(77);
+
+    // search looks at every tag, whatever segment is open
+    await userEvent.type(screen.getByRole('searchbox'), '#ani');
+    expect(screen.getAllByRole('link', { name: /^#/ }).map((l) => l.textContent)).toEqual(['#anime 8']);
+  });
+
+  it('tags page opens the letter from the link', async () => {
+    fakeBackend({ 'GET /api/tags': () => [200, { tags: [{ tag: 'futsal', count: 2 }, { tag: 'anime', count: 3 }], total: 2 }] });
+    renderAt('/tags?letter=F');
+    expect(await screen.findByRole('button', { name: 'Tags starting with F' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getAllByRole('link', { name: /^#/ }).map((l) => l.textContent)).toEqual(['#futsal 2']);
+  });
+
   it('search sends the query to the API', async () => {
     const be = fakeBackend(publicRoutes);
     renderAt('/');
@@ -148,8 +193,12 @@ describe('public pages', () => {
     expect(await within(share).findByRole('status')).toHaveTextContent('Link copied.');
 
     // no file sharing in this browser: the story picture is downloaded instead
+    const downloads = [];
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function save() { downloads.push(this.download); });
     await userEvent.click(within(share).getByRole('button', { name: 'Instagram / TikTok story' }));
     expect(await within(share).findByRole('status')).toHaveTextContent('Story picture saved');
+    expect(downloads).toEqual(['hello-story.png']);
+    click.mockRestore();
     expect(be.calls.some((c) => c.url === '/og/hello/story.png')).toBe(true);
   });
 

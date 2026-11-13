@@ -9,6 +9,7 @@ import Editor from './pages/Editor.jsx';
 import Moderation from './pages/Moderation.jsx';
 import NotFound from './pages/NotFound.jsx';
 import Stats from './pages/Stats.jsx';
+import Tags from './pages/Tags.jsx';
 import { usePageViews } from './hooks.js';
 
 function RequireAdmin({ children }) {
@@ -33,6 +34,7 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Home />} />
       <Route path="/tag/:tag" element={<Home />} />
+      <Route path="/tags" element={<Tags />} />
       <Route path="/post/:slug" element={<Post />} />
       <Route path="/admin/login" element={<Login />} />
       <Route path="/admin" element={<RequireAdmin><Dashboard /></RequireAdmin>} />

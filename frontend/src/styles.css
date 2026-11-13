@@ -253,6 +253,16 @@ button.link.danger { color: #b3321f; }
   font: 500 14px var(--font-ui); text-decoration: none; color: var(--text);
 }
 .chip b { font-weight: 500; opacity: .7; margin-left: 2px; }
+.chip.more { border-style: dashed; }
+.segments { display: flex; gap: 6px; overflow-x: auto; padding: 4px 2px 10px; margin: 0 0 4px; scrollbar-width: thin; }
+.seg { flex: none; min-width: 38px; padding: 5px 12px; font: 600 14px var(--font-ui); background: rgba(255, 244, 220, .1); color: var(--text); border: 2px solid rgba(255, 214, 150, .35); box-shadow: none; }
+.seg:active { transform: none; box-shadow: none; }
+.seg:hover, .seg.on { background: var(--amber); color: #3a2314; border-color: var(--clay); }
+[data-theme="day"] .seg:not(.on):not(:hover) { background: rgba(255, 255, 255, .6); border-color: rgba(90, 59, 46, .4); color: var(--text); }
+.tag-panel { margin-top: 26px; }
+.tag-panel .chip { color: var(--ink); background: #fffdf6; border-color: #d8c6a8; }
+.tag-panel .chip:hover { background: var(--amber); color: #3a2314; border-color: var(--clay); }
+.tag-panel .row { margin: 18px 0 0; }
 .chip:hover, .chip.on { background: var(--amber); color: #3a2314; border-color: var(--clay); }
 [data-theme="day"] .chip { background: rgba(255, 255, 255, .6); border-color: rgba(90, 59, 46, .4); }
 .note { color: var(--muted); font-family: var(--font-ui); font-size: 15px; }

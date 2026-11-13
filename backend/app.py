@@ -3,7 +3,7 @@
 The React frontend (../frontend) talks to this API. Public routes:
 
   GET  /api/posts?page=&q=&tag=      list published posts
-  GET  /api/tags                     tags with counts
+  GET  /api/tags?limit=               tags with counts (most used first), and how many there are
   GET  /api/posts/<slug>             one post (rendered HTML)
   GET/POST /api/posts/<slug>/comments    approved comments / leave one (held for review)
   GET/POST /api/posts/<slug>/reactions   reaction counts / toggle one
@@ -511,10 +511,13 @@ def api_posts():
 
 @app.get("/api/tags")
 def api_tags():
+    limit = request.args.get("limit", type=int)
     rows = db().execute(
-        "SELECT t AS tag, COUNT(*) AS count FROM posts, unnest(tags) AS t"
-        " WHERE status = 'published' GROUP BY t ORDER BY count DESC, t").fetchall()
-    resp = jsonify(tags=[{"tag": r["tag"], "count": r["count"]} for r in rows])
+        "SELECT t AS tag, COUNT(*) AS count, COUNT(*) OVER () AS total FROM posts, unnest(tags) AS t"
+        " WHERE status = 'published' GROUP BY t ORDER BY count DESC, t LIMIT %s",
+        (limit if limit and limit > 0 else None,)).fetchall()
+    total = rows[0]["total"] if rows else 0
+    resp = jsonify(tags=[{"tag": r["tag"], "count": r["count"]} for r in rows], total=total)
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
