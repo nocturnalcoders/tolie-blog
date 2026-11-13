@@ -259,6 +259,13 @@ button.link.danger { color: #b3321f; }
 .seg:active { transform: none; box-shadow: none; }
 .seg:hover, .seg.on { background: var(--amber); color: #3a2314; border-color: var(--clay); }
 [data-theme="day"] .seg:not(.on):not(:hover) { background: rgba(255, 255, 255, .6); border-color: rgba(90, 59, 46, .4); color: var(--text); }
+a.seg { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; text-decoration: none; white-space: nowrap; }
+.segments.topics { margin: 18px 0 0; }
+.inline-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.inline-edit input { flex: 1; min-width: 160px; padding: 7px 12px; }
+.inline-edit button { padding: 6px 16px; }
+.add-topic { margin: 16px 10px 10px; }
+.add-topic label { flex-basis: 100%; margin: 0; }
 .tag-panel { margin-top: 26px; }
 .tag-panel .chip { color: var(--ink); background: #fffdf6; border-color: #d8c6a8; }
 .tag-panel .chip:hover { background: var(--amber); color: #3a2314; border-color: var(--clay); }

@@ -103,6 +103,32 @@ describe('public pages', () => {
     expect(screen.getAllByRole('link', { name: /^#/ }).map((l) => l.textContent)).toEqual(['#futsal 2']);
   });
 
+  it('home has a topic bar; a topic page lists only that topic', async () => {
+    const topics = [
+      { slug: 'software', name: 'Software', count: 4 }, { slug: 'security', name: 'Security', count: 2 }, { slug: 'hardware', name: 'Hardware', count: 0 },
+    ];
+    const be = fakeBackend({ ...publicRoutes, 'GET /api/topics': () => [200, { topics }] });
+    renderAt('/');
+    const bar = await screen.findByRole('navigation', { name: 'Topics' });
+    expect(within(bar).getAllByRole('link').map((l) => l.textContent)).toEqual(['All', 'Software', 'Security']); // empty ones hidden
+    expect(within(bar).getByRole('link', { name: 'All' })).toHaveAttribute('aria-current', 'page');
+
+    await userEvent.click(within(bar).getByRole('link', { name: 'Security' }));
+    expect(await screen.findByRole('heading', { name: 'Notes on Security' })).toBeInTheDocument();
+    expect(within(screen.getByRole('navigation', { name: 'Topics' })).getByRole('link', { name: 'Security' })).toHaveAttribute('aria-current', 'page');
+    await waitFor(() => expect(be.calls.some((c) => c.url === '/api/posts?topic=security')).toBe(true));
+  });
+
+  it('post cards and the post page show the topic', async () => {
+    fakeBackend({
+      'GET /api/posts/hello': () => [200, {
+        post: { ...POSTS[0], status: 'published', html: '<p>x</p>', topic: { slug: 'security', name: 'Security' } }, prev: null, next: null,
+      }],
+    });
+    renderAt('/post/hello');
+    expect(await screen.findByRole('link', { name: 'Security' })).toHaveAttribute('href', '/topic/security');
+  });
+
   it('search sends the query to the API', async () => {
     const be = fakeBackend(publicRoutes);
     renderAt('/');
@@ -387,6 +413,56 @@ describe('admin', () => {
     await userEvent.upload(screen.getByLabelText('Choose an image'), new File(['x'], 'notes.pdf', { type: 'application/pdf' }), { applyAccept: false });
     expect(await screen.findByRole('alert')).toHaveTextContent('Only PNG, JPG, GIF, and WebP');
     expect(be.calls.some((c) => c.url === '/api/admin/upload')).toBe(false);
+  });
+
+  it('editor saves the chosen topic', async () => {
+    const be = fakeBackend({
+      'POST /api/admin/preview': () => [200, { html: '' }],
+      'GET /api/admin/topics': () => [200, { topics: [{ id: 3, slug: 'security', name: 'Security', count: 0 }, { id: 4, slug: 'hardware', name: 'Hardware', count: 0 }] }],
+      'POST /api/admin/posts': () => [201, { post: { id: 9, slug: 'chips', title: 'Chips', excerpt: '', tags: [], status: 'draft', body: '', topic_id: 4 } }],
+      'GET /api/admin/posts/9': () => [200, { post: { id: 9, slug: 'chips', title: 'Chips', excerpt: '', tags: [], status: 'draft', body: '', topic_id: 4 } }],
+    }, { admin: true });
+    renderAt('/admin/new');
+    await userEvent.type(await screen.findByLabelText('Title'), 'Chips');
+    await screen.findByRole('option', { name: 'Hardware' });
+    await userEvent.selectOptions(screen.getByLabelText(/^Topic/), 'Hardware');
+    await userEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+    await waitFor(() => expect(be.calls.some((c) => c.url === '/api/admin/posts')).toBe(true));
+    expect(JSON.parse(be.calls.find((c) => c.url === '/api/admin/posts').body)).toMatchObject({ title: 'Chips', topic_id: 4 });
+    // reopened for editing, the topic is still picked
+    await waitFor(() => expect(screen.getByLabelText(/^Topic/)).toHaveValue('4'));
+  });
+
+  it('topics page adds, renames, reorders and deletes topics', async () => {
+    let topics = [{ id: 1, slug: 'software', name: 'Software', count: 3 }, { id: 2, slug: 'security', name: 'Security', count: 1 }];
+    const be = fakeBackend({
+      'GET /api/admin/topics': () => [200, { topics }],
+      'POST /api/admin/topics': (_u, o) => { topics = [...topics, { id: 3, slug: 'microchips', name: JSON.parse(o.body).name, count: 0 }]; return [201, { topics }]; },
+      'PUT /api/admin/topics/2': (_u, o) => { topics = topics.map((t) => (t.id === 2 ? { ...t, name: JSON.parse(o.body).name } : t)); return [200, { topics }]; },
+      'POST /api/admin/topics/order': (_u, o) => { const ids = JSON.parse(o.body).ids; topics = ids.map((id) => topics.find((t) => t.id === id)); return [200, { topics }]; },
+      'DELETE /api/admin/topics/1': () => { topics = topics.filter((t) => t.id !== 1); return [200, { topics }]; },
+    }, { admin: true });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    renderAt('/admin/topics');
+    const names = () => screen.getAllByRole('row').slice(1).map((r) => within(r).queryAllByRole('link')[0]?.textContent);
+
+    await userEvent.type(await screen.findByLabelText('New topic'), 'Microchips');
+    await userEvent.click(screen.getByRole('button', { name: 'Add topic' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('Added “Microchips”.');
+
+    await userEvent.click(within(screen.getAllByRole('row')[2]).getByRole('button', { name: 'Rename' }));
+    const input = screen.getByLabelText('New name for Security');
+    await userEvent.clear(input);
+    await userEvent.type(input, 'Cyber security{enter}');
+    expect(await screen.findByRole('link', { name: 'Cyber security' })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Move Microchips up' }));
+    await waitFor(() => expect(names()).toEqual(['Software', 'Microchips', 'Cyber security']));
+    expect(JSON.parse(be.calls.find((c) => c.url === '/api/admin/topics/order').body)).toEqual({ ids: [1, 3, 2] });
+
+    await userEvent.click(within(screen.getAllByRole('row')[1]).getByRole('button', { name: 'Delete' }));
+    expect(window.confirm).toHaveBeenCalledWith('Delete the topic “Software”? Its 3 posts will have no topic, but stay published.');
+    await waitFor(() => expect(names()).toEqual(['Microchips', 'Cyber security']));
   });
 
   it('editor refuses to save without a title', async () => {

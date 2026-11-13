@@ -28,7 +28,11 @@ export default function Post() {
             <p className="flash err" role="status">Draft preview. Only you can see this page.</p>
           )}
           <header className="post-hero">
-            <p className="meta"><Link to="/">Notes</Link> · {formatDate(post.date)} · {post.read_min} min read</p>
+            <p className="meta">
+              <Link to="/">Notes</Link>
+              {post.topic && <> · <Link to={`/topic/${post.topic.slug}`}>{post.topic.name}</Link></>}
+              {' '}· {formatDate(post.date)} · {post.read_min} min read
+            </p>
             <h1>{post.title}</h1>
             {post.tags.length > 0 && (
               <ul className="tags">
@@ -37,7 +41,7 @@ export default function Post() {
             )}
           </header>
           <article className="card article">
-            <span className="tab">{post.tags[0] || 'Note'}</span>
+            <span className="tab">{post.topic ? post.topic.name : post.tags[0] || 'Note'}</span>
             {post.toc && post.toc.length >= 3 && (
               <nav className="toc" aria-labelledby="toc-title">
                 <p id="toc-title">On this page</p>
@@ -65,7 +69,7 @@ export default function Post() {
               <div className="related-grid">
                 {data.related.map((r) => (
                   <article key={r.slug} className="card mini">
-                    <span className="tab">{r.tags[0] || 'Note'}</span>
+                    <span className="tab">{r.topic ? r.topic.name : r.tags[0] || 'Note'}</span>
                     <h3><Link to={`/post/${r.slug}`}>{r.title}</Link></h3>
                     <p className="meta">{formatDate(r.date)} · {r.read_min} min read</p>
                   </article>

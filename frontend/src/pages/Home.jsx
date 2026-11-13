@@ -8,7 +8,7 @@ import { useApi, useDocumentTitle } from '../hooks.js';
 const TOP_TAGS = 12;
 
 export default function Home() {
-  const { tag } = useParams();
+  const { tag, topic } = useParams();
   const [params, setParams] = useSearchParams();
   const q = params.get('q') || '';
   const page = Math.max(1, parseInt(params.get('page') || '1', 10) || 1);
@@ -16,15 +16,22 @@ export default function Home() {
   const qs = new URLSearchParams();
   if (q) qs.set('q', q);
   if (tag) qs.set('tag', tag);
+  if (topic) qs.set('topic', topic);
   if (page > 1) qs.set('page', String(page));
   const list = useApi(`/api/posts?${qs.toString()}`);
   const tags = useApi(`/api/tags?limit=${TOP_TAGS}`);
+  const topics = useApi('/api/topics');
 
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
 
+  // Topics with nothing published yet stay hidden, except the one that is open.
+  const topicList = topics.data ? topics.data.topics.filter((t) => t.count > 0 || t.slug === topic) : [];
+  const current = topics.data && topic ? topics.data.topics.find((t) => t.slug === topic) : null;
+  const topicName = current ? current.name : topic;
+
   useDocumentTitle(
-    `${tag ? `#${tag} · ` : q ? `Search: ${q} · ` : ''}Notes from the little town · tolie.space`
+    `${tag ? `#${tag} · ` : topic ? `${topicName} · ` : q ? `Search: ${q} · ` : ''}Notes from the little town · tolie.space`
   );
 
   const onSearch = (e) => {
@@ -45,10 +52,21 @@ export default function Home() {
       <section className="hero">
         <img className="avatar" src="/avatar.jpg" width="96" height="96" alt="Ghibli-style portrait of Christianto Lie" />
         <div>
-          <h1>{tag ? `Notes tagged #${tag}` : 'Notes from the little town'}</h1>
+          <h1>{tag ? `Notes tagged #${tag}` : topic ? `Notes on ${topicName}` : 'Notes from the little town'}</h1>
           <p>Software, football, anime, books, and whatever I’m learning this week.</p>
         </div>
       </section>
+
+      {topicList.length > 0 && (
+        <nav className="segments topics" aria-label="Topics">
+          <Link className={`seg${!topic && !tag ? ' on' : ''}`} to="/" aria-current={!topic && !tag ? 'page' : undefined}>All</Link>
+          {topicList.map((t) => (
+            <Link key={t.slug} className={`seg${t.slug === topic ? ' on' : ''}`} to={`/topic/${t.slug}`} aria-current={t.slug === topic ? 'page' : undefined}>
+              {t.name}
+            </Link>
+          ))}
+        </nav>
+      )}
 
       <form className="search" onSubmit={onSearch} role="search">
         <label className="sr" htmlFor="q">Search notes</label>

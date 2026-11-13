@@ -41,6 +41,7 @@ export default function Dashboard() {
         <div className="row">
           <Link className="btn" to="/admin/new">New note</Link>
           <Link className="btn ghost" to="/admin/stats">Traffic</Link>
+          <Link className="btn ghost" to="/admin/topics">Topics</Link>
           <Link className="btn ghost" to="/admin/comments">Comments{pending > 0 ? ` (${pending} waiting)` : ''}</Link>
           <button className="ghost" type="button" onClick={signOut}>Sign out</button>
         </div>

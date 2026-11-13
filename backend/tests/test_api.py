@@ -217,6 +217,33 @@ ok('no share picture for drafts or unknown kinds', anon.get(f'/og/{slug}/card.pn
 shell = anon.get(f'/post/{H}').get_data(as_text=True)
 ok('post shell has og:image + large twitter card', f'og:image" content="https://blog.example.test/og/{H}/card.png"' in shell and 'summary_large_image' in shell and 'og:url' in shell)
 
+# topics
+tp = anon.get('/api/topics').json['topics']
+ok('starter topics in order', [x['name'] for x in tp] == ['Software', 'Security', 'Hardware', 'Football', 'Anime & Books', 'Life'] and tp[4]['slug'] == 'anime-books' and all(x['count'] == 0 for x in tp))
+ok('topics admin needs login', anon.get('/api/admin/topics').status_code == 401 and J(v, 'post', '/api/admin/topics', {'name': 'x'}, vt).status_code == 401)
+r = J(c, 'post', '/api/admin/topics', {'name': '  Micro   chips '}, tok)
+ok('create topic', r.status_code == 201 and r.json['topics'][-1]['name'] == 'Micro chips' and r.json['topics'][-1]['slug'] == 'micro-chips')
+ok('duplicate / empty topic refused', J(c, 'post', '/api/admin/topics', {'name': 'micro chips'}, tok).status_code == 400 and J(c, 'post', '/api/admin/topics', {'name': ' '}, tok).status_code == 400)
+ids = {x['slug']: x['id'] for x in c.get('/api/admin/topics').json['topics']}
+r = J(c, 'put', f"/api/admin/topics/{ids['micro-chips']}", {'name': 'Hardware & Chips'}, tok)
+ok('rename keeps the address', [x for x in r.json['topics'] if x['id'] == ids['micro-chips']][0] == {'id': ids['micro-chips'], 'slug': 'micro-chips', 'name': 'Hardware & Chips', 'count': 0})
+order = [ids['security'], ids['micro-chips']] + [i for k, i in ids.items() if k not in ('security', 'micro-chips')]
+ok('reorder', [x['slug'] for x in J(c, 'post', '/api/admin/topics/order', {'ids': order}, tok).json['topics']][:2] == ['security', 'micro-chips'])
+r = J(c, 'post', '/api/admin/posts', {'title': 'XSS in 2026', 'body': 'Escape it.', 'tags': 'xss', 'topic_id': ids['security'], 'action': 'publish'}, tok)
+ok('post saved with topic', r.status_code == 201 and r.json['post']['topic_id'] == ids['security'] and r.json['post']['topic'] == {'slug': 'security', 'name': 'Security'})
+sec_id = r.json['post']['id']
+ok('unknown topic refused', J(c, 'post', '/api/admin/posts', {'title': 'x', 'topic_id': 999999}, tok).status_code == 400)
+ok('filter by topic', [p['slug'] for p in anon.get('/api/posts?topic=security').json['posts']] == ['xss-in-2026'] and anon.get('/api/posts?topic=nope').json['total'] == 0)
+ok('public topic counts published posts', {x['slug']: x['count'] for x in anon.get('/api/topics').json['topics']}['security'] == 1)
+ok('post page carries its topic', anon.get('/api/posts/xss-in-2026').json['post']['topic']['name'] == 'Security' and anon.get(f'/api/posts/{H}').json['post']['topic'] is None)
+J(c, 'delete', f"/api/admin/topics/{ids['security']}", None, tok)
+ok('deleting a topic keeps its posts', anon.get('/api/posts/xss-in-2026').status_code == 200 and anon.get('/api/posts/xss-in-2026').json['post']['topic'] is None)
+for x in c.get('/api/admin/topics').json['topics']:
+    J(c, 'delete', f"/api/admin/topics/{x['id']}", None, tok)
+A.init_db()
+ok('starter topics are not brought back after you delete them', anon.get('/api/topics').json['topics'] == [])
+J(c, 'delete', f'/api/admin/posts/{sec_id}', None, tok)
+
 # delete / logout / lockout
 ok('delete', J(c, 'delete', f'/api/admin/posts/{pid2}', None, tok).status_code == 200 and c.get(f'/api/posts/my-first-draft-2').status_code == 404)
 r = J(c, 'post', '/api/logout', None, tok); ok('logout', r.json['admin'] is False and c.get('/api/admin/posts').status_code == 401)

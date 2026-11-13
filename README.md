@@ -90,6 +90,8 @@ docker run --rm -v tolie-blog_uploads:/data -v "$PWD/backups:/in:ro" alpine \
 ## Comments, traffic and sharing
 
 - New comments wait for you at `/admin/comments`. Traffic is at `/admin/stats`.
+- Topics (the few big sections on the home page, one per note) are managed at `/admin/topics`.
+  The first deploy creates Software, Security, Hardware, Football, Anime & Books and Life once.
 - To get a message for every new comment, add the Telegram and/or email settings from
   `.env.example` to `.env` on the droplet, then run `bash deploy/deploy.sh`.
   Quick Telegram setup: message `@BotFather`, send `/newbot`, copy the token into `BLOG_TELEGRAM_TOKEN`.

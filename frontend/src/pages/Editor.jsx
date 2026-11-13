@@ -3,9 +3,9 @@ import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import Layout from '../components/Layout.jsx';
 import Prose from '../components/Prose.jsx';
 import { api } from '../api.js';
-import { useDocumentTitle } from '../hooks.js';
+import { useApi, useDocumentTitle } from '../hooks.js';
 
-const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '' };
+const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '', topic_id: null };
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
 function fileSize(bytes) {
@@ -42,6 +42,7 @@ export default function Editor() {
   const fileRef = useRef(null);
   const caretRef = useRef(null); // where the cursor was last, since opening the file picker can lose it
   const [dropping, setDropping] = useState(false);
+  const topics = useApi('/api/admin/topics');
   useDocumentTitle(`${isNew ? 'New note' : 'Edit note'} · tolie.space notes`);
 
   // Load the post when editing.
@@ -57,7 +58,7 @@ export default function Editor() {
     api(`/api/admin/posts/${id}`)
       .then(({ post }) => {
         if (!alive) return;
-        setForm({ title: post.title, slug: post.slug, tags: post.tags.join(', '), excerpt: post.excerpt, body: post.body });
+        setForm({ title: post.title, slug: post.slug, tags: post.tags.join(', '), excerpt: post.excerpt, body: post.body, topic_id: post.topic_id ?? null });
         setStatus(post.status);
         setDirty(false);
         setLoaded(true);
@@ -295,6 +296,22 @@ export default function Editor() {
 
           <label htmlFor="title">Title</label>
           <input id="title" type="text" maxLength={150} value={form.title} onChange={change('title')} />
+
+          <label htmlFor="topic">Topic <small>(<Link to="/admin/topics">manage topics</Link>)</small></label>
+          <select
+            id="topic"
+            value={form.topic_id ?? ''}
+            onChange={(e) => {
+              const value = e.target.value;
+              setForm((f) => ({ ...f, topic_id: value ? Number(value) : null }));
+              setDirty(true);
+            }}
+          >
+            <option value="">No topic</option>
+            {(topics.data ? topics.data.topics : []).map((t) => (
+              <option key={t.id} value={t.id}>{t.name}</option>
+            ))}
+          </select>
 
           <div className="two-col">
             <div>

@@ -2,7 +2,8 @@
 
 The React frontend (../frontend) talks to this API. Public routes:
 
-  GET  /api/posts?page=&q=&tag=      list published posts
+  GET  /api/posts?page=&q=&tag=&topic=   list published posts
+  GET  /api/topics                   the topics (Software, Security, ...) with post counts
   GET  /api/tags?limit=               tags with counts (most used first), and how many there are
   GET  /api/posts/<slug>             one post (rendered HTML)
   GET/POST /api/posts/<slug>/comments    approved comments / leave one (held for review)
@@ -21,6 +22,7 @@ Admin routes need a signed-in session and a CSRF header:
   POST /api/admin/preview  POST /api/admin/upload
   GET  /api/admin/comments?status=   PUT/DELETE /api/admin/comments/<id>
   GET  /api/admin/stats?days=7|30|90 traffic summary
+  GET/POST /api/admin/topics   PUT/DELETE /api/admin/topics/<id>   POST /api/admin/topics/order
 
 Configuration comes from environment variables (docker-compose.yml sets them).
 New comments can be announced on Telegram and/or by email (see .env.example).
@@ -191,7 +193,22 @@ CREATE TABLE IF NOT EXISTS page_views (
 CREATE INDEX IF NOT EXISTS idx_views_time ON page_views (created_at);
 CREATE INDEX IF NOT EXISTS idx_views_visitor ON page_views (visitor, path, created_at);
 ALTER TABLE page_views ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS topics (
+  id       BIGSERIAL PRIMARY KEY,
+  slug     TEXT NOT NULL UNIQUE,
+  name     TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0
+);
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS topic_id BIGINT REFERENCES topics (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_posts_topic ON posts (topic_id);
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
+
+# The first topics. Created once; after that they are managed on /admin/topics.
+SEED_TOPICS = ["Software", "Security", "Hardware", "Football", "Anime & Books", "Life"]
 
 SEED_BODY = """This is the first note on the blog. It is written in Markdown, stored in PostgreSQL,
 and served by a Python API to a React frontend, all running in Docker.
@@ -262,6 +279,12 @@ def init_db() -> None:
                         ("hello-from-the-little-town", "Hello from the little town",
                          "A first note: what this blog is, how it works, and what to expect.",
                          SEED_BODY, ["hello", "meta"]))
+                seeded = conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('topics_seeded', '1') ON CONFLICT DO NOTHING").rowcount
+                if seeded:
+                    for i, name in enumerate(SEED_TOPICS):
+                        conn.execute("INSERT INTO topics (slug, name, position) VALUES (%s, %s, %s)"
+                                     " ON CONFLICT (slug) DO NOTHING", (slugify(name), name, i))
             break
         except psycopg.OperationalError as exc:
             last_error = exc
@@ -370,11 +393,21 @@ def summary(row: dict, admin: bool = False) -> dict:
         "tags": list(row["tags"]),
         "date": iso(row["published_at"] or row["created_at"]),
         "read_min": max(1, round(words / 200)),
+        "topic": topics_by_id().get(row.get("topic_id")),
     }
     if admin:
         data["status"] = row["status"]
         data["updated_at"] = iso(row["updated_at"])
+        data["topic_id"] = row.get("topic_id")
     return data
+
+
+def topics_by_id() -> dict:
+    """{id: {slug, name}}, read once per request (there are only a handful)."""
+    if "topics" not in g:
+        g.topics = {r["id"]: {"slug": r["slug"], "name": r["name"]}
+                    for r in db().execute("SELECT id, slug, name FROM topics").fetchall()}
+    return g.topics
 
 
 # --------------------------------------------------------------------------
@@ -493,6 +526,7 @@ def list_posts(where: str, args: list, page: int, admin: bool = False):
 def api_posts():
     q = (request.args.get("q") or "").strip()[:80]
     tag = re.sub(r"[^a-z0-9\-+#]", "", (request.args.get("tag") or "").lower())
+    topic = re.sub(r"[^a-z0-9-]", "", (request.args.get("topic") or "").lower())
     page = max(1, request.args.get("page", type=int) or 1)
     where, args = "status = 'published'", []
     if q:
@@ -503,8 +537,22 @@ def api_posts():
     if tag:
         where += " AND tags @> %s::text[]"
         args.append([tag])
+    if topic:
+        where += " AND topic_id = (SELECT id FROM topics WHERE slug = %s)"
+        args.append(topic)
     posts, total, pages = list_posts(where, args, page)
-    resp = jsonify(posts=posts, total=total, page=page, pages=pages, q=q, tag=tag)
+    resp = jsonify(posts=posts, total=total, page=page, pages=pages, q=q, tag=tag, topic=topic)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/topics")
+def api_topics():
+    rows = db().execute(
+        "SELECT t.slug, t.name, COUNT(p.id) AS count FROM topics t"
+        " LEFT JOIN posts p ON p.topic_id = t.id AND p.status = 'published'"
+        " GROUP BY t.id ORDER BY t.position, t.id").fetchall()
+    resp = jsonify(topics=[{"slug": r["slug"], "name": r["name"], "count": r["count"]} for r in rows])
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
@@ -810,6 +858,7 @@ def read_payload() -> dict:
         "tags": parse_tags(str(tags)),
         "body_md": str(data.get("body", "")).replace("\r\n", "\n")[:200000],
         "action": str(data.get("action", "draft")),
+        "topic_id": data.get("topic_id") if isinstance(data.get("topic_id"), int) else None,
     }
 
 
@@ -825,26 +874,95 @@ def admin_save(pid: int | None = None):
     form = read_payload()
     if not form["title"]:
         return jsonify(error="Give the post a title first."), 400
+    if form["topic_id"] is not None and form["topic_id"] not in topics_by_id():
+        return jsonify(error="That topic doesn't exist any more. Pick another one."), 400
     slug = unique_slug(slugify(form["slug"] or form["title"]), ignore_id=pid)
     excerpt = form["excerpt"] or auto_excerpt(form["body_md"])
     action = form["action"]
     if existing:
         status = {"publish": "published", "draft": "draft"}.get(action, existing["status"])
         row = db().execute(
-            """UPDATE posts SET slug=%s, title=%s, excerpt=%s, body_md=%s, tags=%s, status=%s, updated_at=now(),
-                 published_at = COALESCE(published_at, CASE WHEN %s = 'published' THEN now() END)
+            """UPDATE posts SET slug=%s, title=%s, excerpt=%s, body_md=%s, tags=%s, topic_id=%s, status=%s,
+                 updated_at=now(), published_at = COALESCE(published_at, CASE WHEN %s = 'published' THEN now() END)
                WHERE id=%s RETURNING *""",
-            (slug, form["title"], excerpt, form["body_md"], form["tags"], status, status, pid)).fetchone()
+            (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status, status,
+             pid)).fetchone()
     else:
         status = "published" if action == "publish" else "draft"
         row = db().execute(
-            """INSERT INTO posts (slug, title, excerpt, body_md, tags, status, published_at)
-               VALUES (%s, %s, %s, %s, %s, %s, CASE WHEN %s = 'published' THEN now() END) RETURNING *""",
-            (slug, form["title"], excerpt, form["body_md"], form["tags"], status, status)).fetchone()
+            """INSERT INTO posts (slug, title, excerpt, body_md, tags, topic_id, status, published_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s = 'published' THEN now() END) RETURNING *""",
+            (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status,
+             status)).fetchone()
     db().commit()
     post = summary(row, admin=True)
     post["body"] = row["body_md"]
     return jsonify(post=post), (200 if existing else 201)
+
+
+def topic_rows() -> list[dict]:
+    return [{"id": r["id"], "slug": r["slug"], "name": r["name"], "count": r["count"]} for r in db().execute(
+        "SELECT t.*, COUNT(p.id) AS count FROM topics t LEFT JOIN posts p ON p.topic_id = t.id"
+        " GROUP BY t.id ORDER BY t.position, t.id").fetchall()]
+
+
+def topic_name() -> str:
+    return re.sub(r"\s+", " ", str((request.get_json(silent=True) or {}).get("name", ""))).strip()[:40]
+
+
+@app.get("/api/admin/topics")
+@admin_required
+def admin_topics():
+    return jsonify(topics=topic_rows())
+
+
+@app.post("/api/admin/topics")
+@admin_required
+def admin_topic_create():
+    name = topic_name()
+    if not name:
+        return jsonify(error="Give the topic a name."), 400
+    slug = slugify(name)
+    if db().execute("SELECT 1 FROM topics WHERE slug = %s", (slug,)).fetchone():
+        return jsonify(error="There is already a topic with that name."), 400
+    db().execute("INSERT INTO topics (slug, name, position)"
+                 " VALUES (%s, %s, (SELECT COALESCE(MAX(position), -1) + 1 FROM topics))", (slug, name))
+    db().commit()
+    return jsonify(topics=topic_rows()), 201
+
+
+@app.put("/api/admin/topics/<int:tid>")
+@admin_required
+def admin_topic_rename(tid: int):
+    # The address (/topic/<slug>) stays the same, so links that were shared keep working.
+    name = topic_name()
+    if not name:
+        return jsonify(error="Give the topic a name."), 400
+    row = db().execute("UPDATE topics SET name = %s WHERE id = %s RETURNING id", (name, tid)).fetchone()
+    db().commit()
+    if row is None:
+        return jsonify(error="Topic not found."), 404
+    return jsonify(topics=topic_rows())
+
+
+@app.post("/api/admin/topics/order")
+@admin_required
+def admin_topic_order():
+    ids = (request.get_json(silent=True) or {}).get("ids", [])
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        return jsonify(error="Bad order."), 400
+    for pos, tid in enumerate(ids):
+        db().execute("UPDATE topics SET position = %s WHERE id = %s", (pos, tid))
+    db().commit()
+    return jsonify(topics=topic_rows())
+
+
+@app.delete("/api/admin/topics/<int:tid>")
+@admin_required
+def admin_topic_delete(tid: int):
+    db().execute("DELETE FROM topics WHERE id = %s", (tid,))  # its posts simply have no topic now
+    db().commit()
+    return jsonify(topics=topic_rows())
 
 
 @app.delete("/api/admin/posts/<int:pid>")
