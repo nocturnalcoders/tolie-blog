@@ -69,6 +69,20 @@ gunzip -c backups/blog-YYYYMMDD-HHMM.sql.gz | docker compose exec -T db psql -U 
 docker compose restart api
 ```
 
+## Comments, traffic and sharing
+
+- New comments wait for you at `/admin/comments`. Traffic is at `/admin/stats`.
+- To get a message for every new comment, add the Telegram and/or email settings from
+  `.env.example` to `.env` on the droplet, then run `bash deploy/deploy.sh`.
+  Quick Telegram setup: message `@BotFather`, send `/newbot`, copy the token into `BLOG_TELEGRAM_TOKEN`.
+  Send your new bot any message, open `https://api.telegram.org/bot<token>/getUpdates`, and put the
+  `"chat":{"id": ...}` number into `BLOG_TELEGRAM_CHAT_ID`.
+- Countries on the traffic page come from the free DB-IP country database, downloaded each time the
+  API image is built (so it stays fresh with every deploy). If Cloudflare is in front, its
+  `CF-IPCountry` header is used instead.
+- Every post gets share pictures: `/og/<slug>/card.png` (link previews) and `/og/<slug>/story.png`
+  (Instagram/TikTok stories). They are made on first request and cached.
+
 ## Everyday commands
 
 ```bash

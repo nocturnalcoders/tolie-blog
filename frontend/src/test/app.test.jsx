@@ -23,7 +23,7 @@ function fakeBackend(routes, { admin = false } = {}) {
     }
     if (!handler) return { ok: false, status: 404, json: async () => ({ error: 'Not found.' }) };
     const [status, body] = await handler(String(url), opts, state);
-    return { ok: status >= 200 && status < 300, status, json: async () => body };
+    return { ok: status >= 200 && status < 300, status, json: async () => body, blob: async () => new Blob([JSON.stringify(body)]) };
   });
   return state;
 }
@@ -117,6 +117,40 @@ describe('public pages', () => {
     const sent = be.calls.find((c) => c.method === 'POST' && c.url === '/api/posts/hello/comments');
     expect(sent.headers['X-CSRF-Token']).toBe('tok-123');
     expect(JSON.parse(sent.body)).toEqual({ name: 'Budi', body: 'Great read', website: '' });
+  });
+
+  it('post page has a table of contents, read next, and share buttons', async () => {
+    const be = fakeBackend({
+      'GET /api/posts/hello': () => [200, {
+        post: { ...POSTS[0], status: 'published', html: '<h2 id="a">A</h2><h3 id="b">B</h3><h2 id="c">C</h2>',
+          toc: [{ id: 'a', title: 'A', level: 2 }, { id: 'b', title: 'B', level: 3 }, { id: 'c', title: 'C & D', level: 2 }] },
+        prev: null, next: null,
+        related: [{ ...POSTS[1] }],
+      }],
+      'GET /og/hello/story.png': () => [200, {}],
+    });
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    URL.createObjectURL = vi.fn(() => 'blob:story');
+    URL.revokeObjectURL = vi.fn();
+    renderAt('/post/hello');
+
+    const toc = await screen.findByRole('navigation', { name: 'On this page' });
+    expect(within(toc).getByRole('link', { name: 'C & D' })).toHaveAttribute('href', '#c');
+    const next = screen.getByRole('region', { name: 'Read next' });
+    expect(within(next).getByRole('link', { name: 'Futsal and code reviews' })).toHaveAttribute('href', '/post/futsal');
+
+    const share = screen.getByRole('region', { name: 'Share this note' });
+    expect(within(share).getByRole('link', { name: 'LinkedIn' }).getAttribute('href'))
+      .toBe(`https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(`${window.location.origin}/post/hello`)}`);
+    await userEvent.click(within(share).getByRole('button', { name: 'Copy link' }));
+    expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/post/hello`);
+    expect(await within(share).findByRole('status')).toHaveTextContent('Link copied.');
+
+    // no file sharing in this browser: the story picture is downloaded instead
+    await userEvent.click(within(share).getByRole('button', { name: 'Instagram / TikTok story' }));
+    expect(await within(share).findByRole('status')).toHaveTextContent('Story picture saved');
+    expect(be.calls.some((c) => c.url === '/og/hello/story.png')).toBe(true);
   });
 
   it('unknown post shows the not-found page', async () => {
@@ -224,6 +258,7 @@ describe('admin', () => {
         pages: [{ path: '/post/hello', title: 'Hello from the little town', views: 12, visitors: 4 }, { path: '/', title: null, views: 9, visitors: 5 }],
         referrers: [{ host: 'google.com', views: 3 }],
         devices: [{ device: 'mobile', views: 13 }, { device: 'desktop', views: 8 }],
+        countries: [{ country: 'ID', views: 15 }, { country: '', views: 2 }], geoip: true,
       }],
     }, { admin: true });
     renderAt('/admin/stats');
@@ -233,6 +268,8 @@ describe('admin', () => {
     expect(screen.getByRole('link', { name: 'Home' })).toHaveAttribute('href', '/');
     expect(screen.getByText('google.com')).toBeInTheDocument();
     expect(screen.getByText('Phone / tablet')).toBeInTheDocument();
+    expect(screen.getByText(/Indonesia/)).toBeInTheDocument();
+    expect(screen.getByText('Unknown')).toBeInTheDocument();
     // the readout follows the focused day
     screen.getByLabelText('9 Nov 2026: 2 views, 1 visitors').focus();
     expect(await screen.findByText(/on 9 Nov 2026/)).toBeInTheDocument();

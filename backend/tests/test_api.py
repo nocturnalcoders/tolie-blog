@@ -22,7 +22,7 @@ threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 from werkzeug.security import generate_password_hash
 SCHEMA = 't_' + secrets.token_hex(6)
-os.environ.update(BLOG_DB_SCHEMA=SCHEMA, BLOG_UPLOAD_DIR=tmp, BLOG_FRONTEND_DIST=dist,
+os.environ.update(BLOG_DB_SCHEMA=SCHEMA, BLOG_UPLOAD_DIR=tmp, BLOG_OG_DIR=os.path.join(tmp, 'og'), BLOG_FRONTEND_DIST=dist,
                   BLOG_SHELL_URL=f'http://127.0.0.1:{httpd.server_address[1]}/index.html',
                   BLOG_SECRET_KEY='x'*64, BLOG_ADMIN_USER='chris',
                   BLOG_ADMIN_HASH=generate_password_hash('correct horse battery'), BLOG_COOKIE_SECURE='0',
@@ -158,6 +158,47 @@ ok('stats top pages', st['pages'][0] == {'path': '/', 'title': None, 'views': 2,
 ok('stats referrers + devices', st['referrers'] == [{'host': 'google.com', 'views': 1}] and {d['device']: d['views'] for d in st['devices']} == {'mobile': 2, 'desktop': 1})
 ok('stats counts comments + reactions', st['comments'] >= 1 and st['reactions'] >= 3)
 ok('stats bad range falls back to 30', c.get('/api/admin/stats?days=5').json['days'] == 30)
+
+ok('country from Cloudflare header', track(anon, '/tag/meta', '', {'User-Agent': 'Mozilla/5.0 (X11) Firefox/130', 'CF-IPCountry': 'ID'}).status_code == 204
+   and {'country': 'ID', 'views': 1} in c.get('/api/admin/stats?days=7').json['countries'])
+
+# notifications
+sent = []
+real_notify = A.notify
+A.notify = lambda subject, text: sent.append((subject, text))
+w2 = A.app.test_client()
+J(w2, 'post', f'/api/posts/{H}/comments', {'name': 'Rina', 'body': 'Lovely lanterns'}, csrf(w2))
+J(c, 'post', f'/api/posts/{H}/comments', {'name': 'x', 'body': 'Author reply'}, tok)
+ok('notify on new comment, not on own reply', len(sent) == 1 and 'Rina' in sent[0][0] and 'Hello from the little town' in sent[0][0]
+   and 'Lovely lanterns' in sent[0][1] and '/admin/comments' in sent[0][1])
+A.notify = real_notify
+posted = []
+class _Res:
+    def read(self): return b'{}'
+real_urlopen = A.urllib.request.urlopen
+A.urllib.request.urlopen = lambda url, data=None, timeout=None: posted.append((url, data)) or _Res()
+A.TELEGRAM_TOKEN, A.TELEGRAM_CHAT_ID = '123:abc', '42'
+A.deliver('New comment', 'hello there')
+ok('telegram message', posted and posted[0][0] == 'https://api.telegram.org/bot123:abc/sendMessage' and b'chat_id=42' in posted[0][1] and b'hello+there' in posted[0][1])
+A.urllib.request.urlopen = real_urlopen
+A.TELEGRAM_TOKEN = A.TELEGRAM_CHAT_ID = ''
+
+# table of contents + read next
+pj = anon.get(f'/api/posts/{H}').json
+ok('toc from headings', [x['title'] for x in pj['post']['toc']] == ['What to expect', 'Code looks like this'] and all(f'id="{x["id"]}"' in pj['post']['html'] for x in pj['post']['toc']))
+ok('read next lists other published posts', [r['slug'] for r in pj['related']] == ['my-first-draft-2'] and 'body' not in pj['related'][0])
+ok('preview still returns html', 'id=' in J(c, 'post', '/api/admin/preview', {'md': '## A & B'}, tok).json['html'])
+ok('toc unescapes titles', A.render_post('## Tom & Jerry <3')[1][0]['title'] == 'Tom & Jerry <3')
+
+# share pictures
+from PIL import Image
+r = anon.get(f'/og/{H}/card.png')
+ok('share card png 1200x630', r.status_code == 200 and r.mimetype == 'image/png' and Image.open(io.BytesIO(r.data)).size == (1200, 630))
+ok('story png 1080x1920', Image.open(io.BytesIO(anon.get(f'/og/{H}/story.png').data)).size == (1080, 1920))
+ok('share picture is cached', anon.get(f'/og/{H}/card.png').data == r.data)
+ok('no share picture for drafts or unknown kinds', anon.get(f'/og/{slug}/card.png').status_code == 404 and anon.get(f'/og/{H}/huge.png').status_code == 404)
+shell = anon.get(f'/post/{H}').get_data(as_text=True)
+ok('post shell has og:image + large twitter card', f'og:image" content="https://blog.example.test/og/{H}/card.png"' in shell and 'summary_large_image' in shell and 'og:url' in shell)
 
 # delete / logout / lockout
 ok('delete', J(c, 'delete', f'/api/admin/posts/{pid2}', None, tok).status_code == 200 and c.get(f'/api/posts/my-first-draft-2').status_code == 404)

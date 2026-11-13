@@ -29,6 +29,14 @@ services:
       BLOG_ADMIN_HASH_B64: ${BLOG_ADMIN_HASH_B64:-pending}
       BLOG_SITE_URL: ${BLOG_SITE_URL:-https://blog.tolie.space}
       BLOG_SHELL_URL: http://web/index.html
+      # Optional: where to send "new comment" notifications (see .env.example)
+      BLOG_TELEGRAM_TOKEN: ${BLOG_TELEGRAM_TOKEN:-}
+      BLOG_TELEGRAM_CHAT_ID: ${BLOG_TELEGRAM_CHAT_ID:-}
+      BLOG_SMTP_HOST: ${BLOG_SMTP_HOST:-}
+      BLOG_SMTP_PORT: ${BLOG_SMTP_PORT:-587}
+      BLOG_SMTP_USER: ${BLOG_SMTP_USER:-}
+      BLOG_SMTP_PASSWORD: ${BLOG_SMTP_PASSWORD:-}
+      BLOG_NOTIFY_EMAIL: ${BLOG_NOTIFY_EMAIL:-}
     volumes:
       - uploads:/data/uploads
     healthcheck:

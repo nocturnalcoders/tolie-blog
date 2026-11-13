@@ -6,6 +6,19 @@ import { formatDate } from '../utils.js';
 
 const RANGES = [7, 30, 90];
 const compact = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+const regionNames = typeof Intl.DisplayNames === 'function' ? new Intl.DisplayNames(['en'], { type: 'region' }) : null;
+
+function countryLabel(code) {
+  if (!code) return 'Unknown';
+  const flag = String.fromCodePoint(...[...code].map((c) => 0x1f1a5 + c.charCodeAt(0)));
+  let name = code;
+  try {
+    name = (regionNames && regionNames.of(code)) || code;
+  } catch {
+    /* unknown code */
+  }
+  return `${flag} ${name}`;
+}
 
 // Round the top of the axis up to 1, 2 or 5 × 10^n so the ticks are clean numbers.
 function niceMax(value) {
@@ -183,13 +196,23 @@ export default function Stats() {
               rows={data.referrers.map((r) => ({ key: r.host, views: r.views, cell: r.host }))}
             />
             <RankTable
-              title="Devices"
-              label="Device"
+              title="Countries"
+              label="Country"
               empty="No visits yet."
-              rows={data.devices.map((d) => ({ key: d.device, views: d.views, cell: d.device === 'mobile' ? 'Phone / tablet' : 'Desktop' }))}
+              rows={(data.countries || []).map((c) => ({ key: c.country || '-', views: c.views, cell: countryLabel(c.country) }))}
             />
           </div>
-          <p className="note">Your own visits while signed in, admin pages, and bots aren’t counted. No cookies are set and no IP addresses are stored.</p>
+          <RankTable
+            title="Devices"
+            label="Device"
+            empty="No visits yet."
+            rows={data.devices.map((d) => ({ key: d.device, views: d.views, cell: d.device === 'mobile' ? 'Phone / tablet' : 'Desktop' }))}
+          />
+          <p className="note">
+            Your own visits while signed in, admin pages, and bots aren’t counted. No cookies are set and no IP addresses are stored.
+            {' '}Countries: <a href="https://db-ip.com" rel="noopener noreferrer">IP Geolocation by DB-IP</a>
+            {data.geoip === false && ' (the country database isn’t installed yet, it downloads on the next deploy)'}.
+          </p>
         </>
       )}
     </Layout>

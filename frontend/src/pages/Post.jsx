@@ -3,6 +3,7 @@ import Layout from '../components/Layout.jsx';
 import Prose from '../components/Prose.jsx';
 import Reactions from '../components/Reactions.jsx';
 import Comments from '../components/Comments.jsx';
+import Share from '../components/Share.jsx';
 import NotFound from './NotFound.jsx';
 import { useApi, useDocumentTitle } from '../hooks.js';
 import { formatDate } from '../utils.js';
@@ -37,9 +38,20 @@ export default function Post() {
           </header>
           <article className="card article">
             <span className="tab">{post.tags[0] || 'Note'}</span>
+            {post.toc && post.toc.length >= 3 && (
+              <nav className="toc" aria-labelledby="toc-title">
+                <p id="toc-title">On this page</p>
+                <ol>
+                  {post.toc.map((t) => (
+                    <li key={t.id} className={`l${t.level}`}><a href={`#${t.id}`}>{t.title}</a></li>
+                  ))}
+                </ol>
+              </nav>
+            )}
             <Prose html={post.html} />
           </article>
           {post.status === 'published' && <Reactions key={`reactions-${post.slug}`} slug={post.slug} />}
+          {post.status === 'published' && <Share key={`share-${post.slug}`} slug={post.slug} title={post.title} />}
           <aside className="card author">
             <img className="avatar" src="/avatar.jpg" width="72" height="72" alt="Ghibli-style portrait of Christianto Lie" />
             <p>
@@ -47,6 +59,20 @@ export default function Post() {
               Senior software engineer, futsal player, night walker. Come say hi in <a href="https://tolie.space">the little town</a>.
             </p>
           </aside>
+          {data.related && data.related.length > 0 && (
+            <section className="related" aria-labelledby="related-title">
+              <h2 id="related-title">Read next</h2>
+              <div className="related-grid">
+                {data.related.map((r) => (
+                  <article key={r.slug} className="card mini">
+                    <span className="tab">{r.tags[0] || 'Note'}</span>
+                    <h3><Link to={`/post/${r.slug}`}>{r.title}</Link></h3>
+                    <p className="meta">{formatDate(r.date)} · {r.read_min} min read</p>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
           {post.status === 'published' && <Comments key={`comments-${post.slug}`} slug={post.slug} />}
           <nav className="pager two" aria-label="More notes">
             {data.prev ? <Link className="btn" to={`/post/${data.prev.slug}`}>← {data.prev.title.length > 34 ? `${data.prev.title.slice(0, 33)}…` : data.prev.title}</Link> : <span />}

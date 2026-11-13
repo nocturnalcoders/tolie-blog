@@ -9,6 +9,7 @@ The React frontend (../frontend) talks to this API. Public routes:
   GET/POST /api/posts/<slug>/reactions   reaction counts / toggle one
   POST /api/track                    count a page view (no cookies, no raw IPs stored)
   GET  /feed.xml  /sitemap.xml  /robots.txt  /healthz  /uploads/<file>
+  GET  /og/<slug>/card.png  /og/<slug>/story.png   share pictures (link preview, Instagram/TikTok story)
   GET  /post/<slug>                  the React shell with SEO meta tags filled in
 
 Admin routes need a signed-in session and a CSRF header:
@@ -22,6 +23,7 @@ Admin routes need a signed-in session and a CSRF header:
   GET  /api/admin/stats?days=7|30|90 traffic summary
 
 Configuration comes from environment variables (docker-compose.yml sets them).
+New comments can be announced on Telegram and/or by email (see .env.example).
 """
 from __future__ import annotations
 
@@ -32,17 +34,22 @@ import html as html_lib
 import os
 import re
 import secrets
+import smtplib
+import threading
 import time
 import unicodedata
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from email.utils import formatdate
 from functools import wraps
-from urllib.parse import urlsplit
 from pathlib import Path
+from urllib.parse import urlsplit
 from xml.sax.saxutils import escape as xml_escape
 
 import markdown as md
+import maxminddb
 import nh3
 import psycopg
 from flask import (Flask, Response, abort, g, jsonify, request,
@@ -51,6 +58,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
+
+import share_image
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -94,6 +103,15 @@ UPLOAD_DIR = Path(os.environ.get("BLOG_UPLOAD_DIR", str(DATA_DIR / "uploads")))
 FRONTEND_DIST = Path(os.environ.get("BLOG_FRONTEND_DIST", str(BASE_DIR.parent / "frontend" / "dist")))
 SHELL_URL = os.environ.get("BLOG_SHELL_URL", "")  # e.g. http://web/index.html inside Docker
 COOKIE_SECURE = os.environ.get("BLOG_COOKIE_SECURE", "1") != "0"
+OG_DIR = Path(os.environ.get("BLOG_OG_DIR", str(UPLOAD_DIR.parent / "og")))
+GEOIP_DB = Path(os.environ.get("BLOG_GEOIP_DB", str(BASE_DIR / "geoip" / "country.mmdb")))
+TELEGRAM_TOKEN = os.environ.get("BLOG_TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("BLOG_TELEGRAM_CHAT_ID", "")
+SMTP_HOST = os.environ.get("BLOG_SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("BLOG_SMTP_PORT", "587") or 587)
+SMTP_USER = os.environ.get("BLOG_SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("BLOG_SMTP_PASSWORD", "")
+NOTIFY_EMAIL = os.environ.get("BLOG_NOTIFY_EMAIL", "")
 PER_PAGE = 8
 MAX_UPLOAD = 5 * 1024 * 1024
 REACTIONS = ("heart", "clap", "laugh", "wow")
@@ -168,6 +186,7 @@ CREATE TABLE IF NOT EXISTS page_views (
 );
 CREATE INDEX IF NOT EXISTS idx_views_time ON page_views (created_at);
 CREATE INDEX IF NOT EXISTS idx_views_visitor ON page_views (visitor, path, created_at);
+ALTER TABLE page_views ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT '';
 """
 
 SEED_BODY = """This is the first note on the blog. It is written in Markdown, stored in PostgreSQL,
@@ -275,10 +294,25 @@ ALLOWED_ATTRS = {
 
 
 def render_md(text: str) -> str:
+    return render_post(text)[0]
+
+
+def render_post(text: str) -> tuple[str, list[dict]]:
+    """HTML plus a table of contents: [{id, title, level}] for the h1-h3 headings."""
     converter = md.Markdown(extensions=MD_EXTENSIONS, extension_configs=MD_CONFIG)
     html = converter.convert(text or "")
-    return nh3.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS,
-                     url_schemes={"http", "https", "mailto"})
+    toc: list[dict] = []
+
+    def walk(tokens: list[dict]) -> None:
+        for t in tokens:
+            if t["level"] <= 3:
+                toc.append({"id": t["id"], "title": html_lib.unescape(re.sub(r"<[^>]+>", "", t["name"])),
+                            "level": t["level"]})
+            walk(t.get("children", []))
+
+    walk(getattr(converter, "toc_tokens", []))
+    clean = nh3.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, url_schemes={"http", "https", "mailto"})
+    return clean, toc
 
 
 def auto_excerpt(text: str, limit: int = 170) -> str:
@@ -486,8 +520,9 @@ def api_post(slug: str):
     if row is None or (row["status"] != "published" and not is_admin()):
         return jsonify(error="That note doesn't exist, or it hasn't been published yet."), 404
     post = summary(row, admin=True)
-    post["html"] = render_md(row["body_md"])
+    post["html"], post["toc"] = render_post(row["body_md"])
     prev_row = nxt_row = None
+    related: list[dict] = []
     if row["status"] == "published":
         key = (row["published_at"], row["id"])
         prev_row = db().execute(
@@ -496,7 +531,12 @@ def api_post(slug: str):
         nxt_row = db().execute(
             "SELECT slug, title FROM posts WHERE status = 'published' AND (published_at, id) > (%s, %s)"
             " ORDER BY published_at ASC, id ASC LIMIT 1", key).fetchone()
-    resp = jsonify(post=post, prev=prev_row, next=nxt_row)
+        # Read next: the most shared tags first, then the newest.
+        related = [summary(r) for r in db().execute(
+            "SELECT *, cardinality(ARRAY(SELECT unnest(tags) INTERSECT SELECT unnest(%s::text[]))) AS shared"
+            " FROM posts WHERE status = 'published' AND id <> %s"
+            " ORDER BY shared DESC, published_at DESC, id DESC LIMIT 3", (list(row["tags"]), row["id"])).fetchall()]
+    resp = jsonify(post=post, prev=prev_row, next=nxt_row, related=related)
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
@@ -561,7 +601,41 @@ def api_comment_create(slug: str):
     db().commit()
     if admin:
         return jsonify(pending=False, comment=comment_json(row)), 201
+    title = db().execute("SELECT title FROM posts WHERE id = %s", (pid,)).fetchone()["title"]
+    notify(f"New comment on “{title}” from {author}",
+           f"{body[:1000]}\n\nApprove or delete it: {SITE_URL}/admin/comments")
     return jsonify(pending=True), 201
+
+
+def notify(subject: str, text: str) -> None:
+    """Tell the owner about something, without making the visitor wait for it."""
+    if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) or (SMTP_HOST and NOTIFY_EMAIL):
+        threading.Thread(target=deliver, args=(subject, text), daemon=True).start()
+
+
+def deliver(subject: str, text: str) -> None:
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": f"{subject}\n\n{text}",
+                                           "disable_web_page_preview": "true"}).encode()
+            urllib.request.urlopen(  # noqa: S310 (fixed https URL)
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data=data, timeout=10).read()
+        except Exception as exc:
+            app.logger.warning("Telegram notification failed: %s", exc)
+    if SMTP_HOST and NOTIFY_EMAIL:
+        try:
+            msg = EmailMessage()
+            msg["Subject"], msg["To"] = subject, NOTIFY_EMAIL
+            msg["From"] = SMTP_USER if "@" in SMTP_USER else NOTIFY_EMAIL
+            msg.set_content(text)
+            with (smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP)(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                if SMTP_PORT != 465:
+                    smtp.starttls()
+                if SMTP_USER:
+                    smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(msg)
+        except Exception as exc:
+            app.logger.warning("Email notification failed: %s", exc)
 
 
 def voter_id() -> str:
@@ -625,6 +699,29 @@ BOT_RE = re.compile(r"bot|crawl|spider|slurp|preview|fetch|curl|wget|python|http
                     re.I)
 MOBILE_RE = re.compile(r"mobile|android|iphone|ipod|ipad|tablet", re.I)
 VIEW_KEEP_DAYS = 400
+_geoip: dict = {"reader": None, "mtime": None}
+
+
+def country_of(ip: str) -> str:
+    """Two-letter country code, from Cloudflare's header or the DB-IP country database."""
+    cf = request.headers.get("CF-IPCountry", "").upper()
+    if re.fullmatch(r"[A-Z]{2}", cf) and cf not in ("XX", "T1"):
+        return cf
+    try:
+        mtime = GEOIP_DB.stat().st_mtime
+    except OSError:
+        return ""
+    if _geoip["mtime"] != mtime:  # (re)open after the file was refreshed
+        try:
+            _geoip.update(reader=maxminddb.open_database(str(GEOIP_DB)), mtime=mtime)
+        except Exception:
+            _geoip.update(reader=None, mtime=mtime)
+    try:
+        rec = _geoip["reader"].get(ip) if _geoip["reader"] else None
+    except ValueError:
+        return ""
+    code = ((rec or {}).get("country") or {}).get("iso_code", "")
+    return code if re.fullmatch(r"[A-Z]{2}", code or "") else ""
 
 
 def visitor_hash() -> str:
@@ -663,9 +760,9 @@ def api_track():
         if post_id is None:
             return "", 204
     db().execute(
-        "INSERT INTO page_views (path, post_id, visitor, referrer, device) VALUES (%s, %s, %s, %s, %s)",
+        "INSERT INTO page_views (path, post_id, visitor, referrer, device, country) VALUES (%s, %s, %s, %s, %s, %s)",
         (path, post_id, visitor, referrer_host(str(payload.get("referrer", ""))),
-         "mobile" if MOBILE_RE.search(ua) else "desktop"))
+         "mobile" if MOBILE_RE.search(ua) else "desktop", country_of(request.remote_addr or "")))
     if secrets.randbelow(200) == 0:  # now and then, forget very old views
         db().execute(f"DELETE FROM page_views WHERE created_at < now() - interval '{VIEW_KEEP_DAYS} days'")
     db().commit()
@@ -803,6 +900,8 @@ def admin_stats():
     refs = q(f"SELECT referrer, COUNT(*) AS views FROM page_views WHERE {since} AND referrer <> ''"
              f" GROUP BY referrer ORDER BY views DESC, referrer LIMIT 10")
     devices = q(f"SELECT device, COUNT(*) AS views FROM page_views WHERE {since} GROUP BY device ORDER BY views DESC")
+    countries = q(f"SELECT country, COUNT(*) AS views FROM page_views WHERE {since}"
+                  f" GROUP BY country ORDER BY views DESC, country LIMIT 12")
     counts = db().execute(
         f"SELECT (SELECT COUNT(*) FROM comments WHERE {since}) AS comments,"
         f" (SELECT COUNT(*) FROM reactions WHERE {since}) AS reactions", (days - 1, days - 1)).fetchone()
@@ -812,7 +911,9 @@ def admin_stats():
         comments=counts["comments"], reactions=counts["reactions"],
         pages=[{"path": r["path"], "title": r["title"], "views": r["views"], "visitors": r["visitors"]} for r in pages],
         referrers=[{"host": r["referrer"], "views": r["views"]} for r in refs],
-        devices=[{"device": r["device"], "views": r["views"]} for r in devices])
+        devices=[{"device": r["device"], "views": r["views"]} for r in devices],
+        countries=[{"country": r["country"], "views": r["views"]} for r in countries],
+        geoip=GEOIP_DB.exists())
 
 
 @app.post("/api/admin/preview")
@@ -901,6 +1002,32 @@ def healthz():
     return Response("ok", mimetype="text/plain")
 
 
+@app.get("/og/<slug>/<kind>.png")
+def og_image(slug: str, kind: str):
+    if kind not in share_image.SIZES:
+        abort(404)
+    row = db().execute("SELECT * FROM posts WHERE slug = %s AND status = 'published'", (slug,)).fetchone()
+    if row is None:
+        abort(404)
+    post = summary(row)
+    meta = f"{format_day(row['published_at'])} · {post['read_min']} min read"
+    site = urlsplit(SITE_URL).netloc
+    key = hashlib.sha256(f"2|{kind}|{row['title']}|{meta}|{post['tags'][:1]}|{site}".encode()).hexdigest()[:16]
+    path = OG_DIR / f"{key}.png"
+    if not path.exists():
+        OG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{secrets.token_hex(4)}.tmp")
+        tmp.write_bytes(share_image.render(kind, row["title"], meta, post["tags"], site))
+        tmp.replace(path)
+    resp = send_from_directory(OG_DIR, path.name, mimetype="image/png", max_age=3600)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+def format_day(value: datetime) -> str:
+    return f"{value.day} {value.strftime('%b %Y')}"
+
+
 @app.get("/uploads/<name>")
 def uploads(name: str):
     if not re.fullmatch(r"[a-f0-9]{16}\.(png|jpg|gif|webp)", name):
@@ -933,15 +1060,23 @@ def read_shell() -> str | None:
         return None
 
 
-def inject_meta(shell: str, title: str, description: str, canonical: str, og_type: str) -> str:
+def inject_meta(shell: str, title: str, description: str, canonical: str, og_type: str, image: str = "") -> str:
     esc = html_lib.escape
+    picture = (
+        f'<meta property="og:image" content="{esc(image, quote=True)}">'
+        '<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">'
+        '<meta name="twitter:card" content="summary_large_image">'
+        f'<meta name="twitter:image" content="{esc(image, quote=True)}">'
+    ) if image else ""
     tags = (
         f'<meta name="description" content="{esc(description, quote=True)}">'
         f'<meta property="og:title" content="{esc(title, quote=True)}">'
         f'<meta property="og:description" content="{esc(description, quote=True)}">'
         f'<meta property="og:type" content="{og_type}">'
         f'<meta property="og:site_name" content="tolie.space notes">'
+        f'<meta property="og:url" content="{esc(canonical, quote=True)}">'
         f'<link rel="canonical" href="{esc(canonical, quote=True)}">'
+        f"{picture}"
     )
     shell = re.sub(r"<title>.*?</title>", lambda _m: f"<title>{esc(title)}</title>", shell, count=1, flags=re.S)
     shell = re.sub(r'<meta name="description"[^>]*>', "", shell, count=1)
@@ -957,7 +1092,7 @@ def post_shell(slug: str):
     if row is None or row["status"] != "published":
         return Response(shell, mimetype="text/html", status=404)
     page = inject_meta(shell, f"{row['title']} · tolie.space notes", row["excerpt"],
-                       f"{SITE_URL}/post/{row['slug']}", "article")
+                       f"{SITE_URL}/post/{row['slug']}", "article", f"{SITE_URL}/og/{row['slug']}/card.png")
     return Response(page, mimetype="text/html")
 
 
@@ -965,7 +1100,7 @@ def post_shell(slug: str):
 @app.get("/<path:path>")
 def frontend_fallback(path: str):
     """Serve the built React app when running without the web container (local development)."""
-    if path.startswith(("api/", "uploads/")):
+    if path.startswith(("api/", "uploads/", "og/")):
         return jsonify(error="Not found."), 404
     target = (FRONTEND_DIST / path).resolve()
     if path and FRONTEND_DIST.resolve() in target.parents and target.is_file():

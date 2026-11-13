@@ -10,6 +10,8 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY . .
+# Country lookup for the traffic page. Refreshed whenever the image is rebuilt (each deploy).
+RUN python fetch_geoip.py geoip/country.mmdb
 RUN useradd --system --uid 10001 --home /app app \
  && mkdir -p /data/uploads \
  && chown -R app:app /data
