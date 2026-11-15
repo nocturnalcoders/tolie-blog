@@ -1,0 +1,48 @@
+# Checks the blog from outside every 10 minutes and sends a Telegram message when it is down.
+# Needs two repository secrets (Settings > Secrets and variables > Actions):
+#   TELEGRAM_TOKEN    the bot token from @BotFather
+#   TELEGRAM_CHAT_ID  your chat id (see README)
+# Optional repository variable BLOG_URL (defaults to https://blog.tolie.space).
+name: Uptime check
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SITE: ${{ vars.BLOG_URL || 'https://blog.tolie.space' }}
+    steps:
+      - name: Is the blog up?
+        run: |
+          # /healthz also checks the database. Three tries, so one slow moment isn't an alarm.
+          for attempt in 1 2 3; do
+            if [ "$(curl -fsS --max-time 15 "$SITE/healthz")" = "ok" ] && curl -fsS --max-time 15 -o /dev/null "$SITE/"; then
+              echo "Up."
+              exit 0
+            fi
+            echo "Attempt $attempt failed."
+            sleep 30
+          done
+          exit 1
+
+      - name: Tell Telegram
+        if: failure()
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then
+            echo "No TELEGRAM_TOKEN / TELEGRAM_CHAT_ID secrets, so no message was sent."
+            exit 0
+          fi
+          curl -fsS -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            -d chat_id="$CHAT" \
+            --data-urlencode text="tolie.space notes looks down: $SITE didn't answer 3 times in a row. On the droplet: cd /opt/tolie-blog && docker compose ps" \
+            > /dev/null
