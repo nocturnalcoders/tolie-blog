@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -362,7 +362,7 @@ describe('admin', () => {
     expect(screen.getByText(/Indonesia/)).toBeInTheDocument();
     expect(screen.getByText('Unknown')).toBeInTheDocument();
     // the readout follows the focused day
-    screen.getByLabelText('9 Nov 2026: 2 views, 1 visitors').focus();
+    act(() => screen.getByLabelText('9 Nov 2026: 2 views, 1 visitors').focus());
     expect(await screen.findByText(/on 9 Nov 2026/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: '7 days' }));
     expect(await screen.findByText('Last 7 days')).toBeInTheDocument();
@@ -471,5 +471,221 @@ describe('admin', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Save draft' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Give the post a title first.');
     expect(be.calls.some((c) => c.url === '/api/admin/posts')).toBe(false);
+  });
+
+  it('login asks for the authenticator code when two-factor is on', async () => {
+    const be = fakeBackend({
+      'POST /api/login': (_u, opts) => {
+        const body = JSON.parse(opts.body);
+        if (!body.code) return [401, { error: 'Enter the 6-digit code from your authenticator app.', need_code: true }];
+        return body.code === '123456' ? [200, { admin: true, csrf: 'tok-9' }] : [401, { error: 'That code didn’t work.', need_code: true }];
+      },
+      'GET /api/admin/posts': () => [200, { posts: [] }],
+    });
+    renderAt('/admin/login');
+    await userEvent.type(await screen.findByLabelText('Username'), 'chris');
+    await userEvent.type(screen.getByLabelText('Password'), 'right-password-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    const code = await screen.findByLabelText(/Code from your authenticator app/);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument(); // not an error, just the next step
+    await userEvent.type(code, '000000');
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('That code didn’t work.');
+    await userEvent.clear(code);
+    await userEvent.type(code, '123456');
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(await screen.findByRole('heading', { name: 'Your notes' })).toBeInTheDocument();
+    expect(JSON.parse(be.calls.filter((c) => c.url === '/api/login').pop().body)).toEqual({ username: 'chris', password: 'right-password-1', code: '123456' });
+  });
+
+  it('security page sets up two-factor login and shows recovery codes', async () => {
+    let on = false;
+    fakeBackend({
+      'GET /api/admin/2fa': () => [200, { enabled: on, recovery_left: on ? 8 : 0 }],
+      'POST /api/admin/2fa/setup': () => [200, { secret: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567', uri: 'otpauth://totp/x', qr: 'data:image/svg+xml,qr' }],
+      'POST /api/admin/2fa/enable': (_u, o) => {
+        if (JSON.parse(o.body).code !== '654321') return [400, { error: 'That code didn’t work.' }];
+        on = true;
+        return [200, { enabled: true, recovery_codes: ['aaaaa-11111', 'bbbbb-22222'] }];
+      },
+    }, { admin: true });
+    renderAt('/admin/security');
+    await userEvent.click(await screen.findByRole('button', { name: 'Set up two-factor login' }));
+    expect(await screen.findByAltText('QR code for your authenticator app')).toHaveAttribute('src', 'data:image/svg+xml,qr');
+    expect(screen.getByText('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567')).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText(/Enter the 6-digit code/), '654321');
+    await userEvent.click(screen.getByRole('button', { name: 'Turn on' }));
+    expect(await screen.findByText('aaaaa-11111')).toBeInTheDocument();
+    expect(await screen.findByText(/8 recovery codes left/)).toBeInTheDocument();
+  });
+
+  it('editor keeps unsaved text on this device and offers it back', async () => {
+    fakeBackend({ 'POST /api/admin/preview': () => [200, { html: '' }] }, { admin: true });
+    const first = renderAt('/admin/new');
+    await userEvent.type(await screen.findByLabelText('Title'), 'Half-written');
+    await userEvent.type(screen.getByLabelText('Write in Markdown'), 'Do not lose me');
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('tolie-draft:new')).form.body).toBe('Do not lose me'), { timeout: 2000 });
+    first.unmount();
+
+    renderAt('/admin/new');
+    const banner = await screen.findByText(/You have unsaved changes from/);
+    expect(screen.getByLabelText('Write in Markdown')).toHaveValue('');
+    await userEvent.click(within(banner.closest('.restore')).getByRole('button', { name: 'Restore them' }));
+    expect(screen.getByLabelText('Write in Markdown')).toHaveValue('Do not lose me');
+    expect(screen.getByLabelText('Title')).toHaveValue('Half-written');
+  });
+
+  it('editor schedules a post for later', async () => {
+    const be = fakeBackend({
+      'POST /api/admin/preview': () => [200, { html: '' }],
+      'POST /api/admin/posts': (_u, o) => [201, { post: { id: 5, slug: 'later', title: 'Later', excerpt: '', tags: [], status: 'published', scheduled: true, publish_at: JSON.parse(o.body).publish_at, body: '' } }],
+      'GET /api/admin/posts/5': () => [200, { post: { id: 5, slug: 'later', title: 'Later', excerpt: '', tags: [], status: 'published', scheduled: true, publish_at: '2030-01-02T01:00:00Z', body: '' } }],
+    }, { admin: true });
+    renderAt('/admin/new');
+    await userEvent.type(await screen.findByLabelText('Title'), 'Later');
+    await userEvent.click(screen.getByRole('button', { name: 'Schedule…' }));
+    const when = screen.getByLabelText('Publish on');
+    await userEvent.clear(when);
+    await userEvent.type(when, '2030-01-02T08:00');
+    await userEvent.click(screen.getByRole('button', { name: 'Schedule' }));
+    await waitFor(() => expect(be.calls.some((c) => c.url === '/api/admin/posts')).toBe(true));
+    const sent = JSON.parse(be.calls.find((c) => c.url === '/api/admin/posts').body);
+    expect(sent.action).toBe('schedule');
+    expect(new Date(sent.publish_at).getTime()).toBe(new Date('2030-01-02T08:00').getTime());
+    expect(await screen.findByText(/Scheduled to go out on/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Publish now' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Unschedule' })).toBeInTheDocument();
+  });
+
+  it('dashboard sets the topic of several notes at once and marks scheduled ones', async () => {
+    let posts = [
+      { ...POSTS[0], status: 'published', updated_at: '2026-11-12T10:00:00Z', topic_id: null },
+      { ...POSTS[1], status: 'published', scheduled: true, publish_at: '2030-01-02T01:00:00Z', updated_at: '2026-11-13T10:00:00Z', topic_id: null },
+    ];
+    const be = fakeBackend({
+      'GET /api/admin/posts': () => [200, { posts }],
+      'GET /api/admin/topics': () => [200, { topics: [{ id: 7, slug: 'security', name: 'Security', count: 0 }] }],
+      'POST /api/admin/posts/topic': (_u, o) => { const b = JSON.parse(o.body); posts = posts.map((p) => (b.ids.includes(p.id) ? { ...p, topic_id: b.topic_id } : p)); return [200, { updated: b.ids.length }]; },
+    }, { admin: true });
+    renderAt('/admin');
+    expect(await screen.findByText(/scheduled · 2 Jan 2030/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Select all notes' }));
+    expect(await screen.findByText('2 selected')).toBeInTheDocument();
+    await screen.findByRole('option', { name: 'Security' });
+    await userEvent.selectOptions(screen.getByLabelText('Topic for the selected notes'), 'Security');
+    await userEvent.click(screen.getByRole('button', { name: 'Set topic' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('2 notes moved to Security.');
+    expect(JSON.parse(be.calls.find((c) => c.url === '/api/admin/posts/topic').body)).toEqual({ ids: [1, 2], topic_id: 7 });
+    await waitFor(() => expect(screen.getAllByRole('cell', { name: 'Security' })).toHaveLength(2));
+  });
+});
+
+describe('about, archive, letters, pictures, replies', () => {
+  const withMail = { 'GET /api/session': () => [200, { admin: false, csrf: 'tok-123', configured: true, mail: true }] };
+
+  it('header lanterns lead to the archive and about pages', async () => {
+    fakeBackend(publicRoutes);
+    renderAt('/');
+    const nav = await screen.findByRole('navigation', { name: 'Main' });
+    expect(within(nav).getByRole('link', { name: /Archive/ })).toHaveAttribute('href', '/archive');
+    expect(within(nav).getByRole('link', { name: /About/ })).toHaveAttribute('href', '/about');
+  });
+
+  it('about page shows the text, and a subscribe box when mail is on', async () => {
+    const be = fakeBackend({
+      ...withMail,
+      'GET /api/about': () => [200, { html: '<p>Hi, I build things.</p>' }],
+      'GET /api/topics': () => [200, { topics: [{ slug: 'security', name: 'Security', count: 3 }] }],
+      'POST /api/subscribe': () => [200, { ok: true }],
+    });
+    renderAt('/about');
+    expect(await screen.findByText('Hi, I build things.')).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('checkbox', { name: 'Security' }));
+    await userEvent.type(screen.getByLabelText('Your email'), 'me@example.com');
+    await userEvent.click(screen.getByRole('button', { name: 'Subscribe' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('check your inbox');
+    expect(JSON.parse(be.calls.find((c) => c.url === '/api/subscribe').body)).toEqual({ email: 'me@example.com', topics: ['security'], website: '' });
+  });
+
+  it('no subscribe box while mail is off', async () => {
+    fakeBackend({ 'GET /api/about': () => [200, { html: '<p>Hi</p>' }] });
+    renderAt('/about');
+    await screen.findByText('Hi');
+    expect(screen.queryByRole('heading', { name: 'Get new notes by email' })).not.toBeInTheDocument();
+  });
+
+  it('archive shows one year at a time, by month', async () => {
+    fakeBackend({ 'GET /api/archive': () => [200, { posts: [
+      { slug: 'b', title: 'Second', date: '2026-11-13T10:00:00Z', topic: { slug: 'security', name: 'Security' } },
+      { slug: 'a', title: 'First', date: '2026-03-02T10:00:00Z', topic: null },
+      { slug: 'old', title: 'Old one', date: '2025-12-31T10:00:00Z', topic: null },
+    ] }] });
+    renderAt('/archive');
+    expect(await screen.findByText('3 notes so far.')).toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(['November', 'March']);
+    expect(screen.getByRole('link', { name: 'Security' })).toHaveAttribute('href', '/topic/security');
+    expect(screen.queryByText('Old one')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: '2025' }));
+    expect(screen.getByRole('link', { name: 'Old one' })).toHaveAttribute('href', '/post/old');
+  });
+
+  it('confirm link confirms; unsubscribe waits for a click', async () => {
+    const be = fakeBackend({
+      'POST /api/subscribe/confirm': () => [200, { ok: true, topics: [] }],
+      'POST /api/unsubscribe': () => [200, { ok: true }],
+    });
+    const view = renderAt('/subscribe/confirm?token=abc');
+    expect(await screen.findByRole('heading', { name: 'You’re in' })).toBeInTheDocument();
+    expect(JSON.parse(be.calls.find((c) => c.url === '/api/subscribe/confirm').body)).toEqual({ token: 'abc' });
+    view.unmount();
+
+    renderAt('/unsubscribe?token=xyz');
+    expect(await screen.findByRole('heading', { name: 'Unsubscribe?' })).toBeInTheDocument();
+    expect(be.calls.some((c) => c.url === '/api/unsubscribe')).toBe(false);
+    await userEvent.click(screen.getByRole('button', { name: 'Unsubscribe' }));
+    expect(await screen.findByRole('heading', { name: 'Done' })).toBeInTheDocument();
+    expect(JSON.parse(be.calls.find((c) => c.url === '/api/unsubscribe').body)).toEqual({ token: 'xyz' });
+  });
+
+  it('pictures in a note open large and close with Escape', async () => {
+    fakeBackend({
+      'GET /api/posts/hello': () => [200, { post: { ...POSTS[0], status: 'published', html: '<p><img src="/uploads/cat.webp" alt="A sleepy cat"></p>' }, prev: null, next: null }],
+    });
+    renderAt('/post/hello');
+    const pic = await screen.findByRole('button', { name: 'Open picture: A sleepy cat' });
+    await userEvent.click(pic);
+    const dialog = screen.getByRole('dialog', { name: 'A sleepy cat' });
+    expect(within(dialog).getByRole('img')).toHaveAttribute('src', expect.stringContaining('/uploads/cat.webp'));
+    expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveFocus();
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(pic).toHaveFocus();
+  });
+
+  it('comments show replies under their comment, and a reply can ask for an email', async () => {
+    const be = fakeBackend({
+      ...withMail,
+      'GET /api/posts/hello': () => [200, { post: { ...POSTS[0], status: 'published', html: '<p>x</p>' }, prev: null, next: null }],
+      'GET /api/posts/hello/comments': () => [200, { comments: [
+        { id: 1, author: 'Ana', body: 'Nice', by_author: false, parent_id: null, date: '2026-11-13T10:00:00Z' },
+        { id: 2, author: 'Christianto Lie', body: 'Thanks Ana', by_author: true, parent_id: 1, date: '2026-11-13T11:00:00Z' },
+      ] }],
+      'POST /api/posts/hello/comments': () => [201, { pending: true }],
+    });
+    renderAt('/post/hello');
+    const replies = await screen.findByRole('list', { name: 'Replies to Ana' });
+    expect(within(replies).getByText('Thanks Ana')).toBeInTheDocument();
+    await userEvent.click(screen.getAllByRole('button', { name: 'Reply' })[0]);
+    expect(screen.getByText(/Replying to/)).toHaveTextContent('Replying to Ana');
+    await userEvent.type(screen.getByLabelText('Name'), 'Budi');
+    await userEvent.type(screen.getByLabelText(/^Comment/), 'Same here');
+    const notify = screen.getByRole('checkbox', { name: 'Email me when someone replies' });
+    expect(notify).toBeDisabled(); // needs an email first
+    await userEvent.type(screen.getByLabelText(/^Email \(optional/), 'budi@example.com');
+    await userEvent.click(notify);
+    await userEvent.click(screen.getByRole('button', { name: 'Post reply' }));
+    expect(await screen.findByText(/once I’ve read it/)).toBeInTheDocument();
+    expect(JSON.parse(be.calls.find((c) => c.method === 'POST' && c.url === '/api/posts/hello/comments').body))
+      .toEqual({ name: 'Budi', body: 'Same here', website: '', parent_id: 1, email: 'budi@example.com', notify: true });
   });
 });

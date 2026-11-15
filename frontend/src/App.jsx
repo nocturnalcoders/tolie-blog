@@ -11,6 +11,12 @@ import NotFound from './pages/NotFound.jsx';
 import Stats from './pages/Stats.jsx';
 import Tags from './pages/Tags.jsx';
 import Topics from './pages/Topics.jsx';
+import Security from './pages/Security.jsx';
+import About from './pages/About.jsx';
+import AboutEdit from './pages/AboutEdit.jsx';
+import Archive from './pages/Archive.jsx';
+import Confirm from './pages/Confirm.jsx';
+import Unsubscribe from './pages/Unsubscribe.jsx';
 import { usePageViews } from './hooks.js';
 
 function RequireAdmin({ children }) {
@@ -36,7 +42,13 @@ export default function App() {
       <Route path="/" element={<Home />} />
       <Route path="/tag/:tag" element={<Home />} />
       <Route path="/tags" element={<Tags />} />
+      <Route path="/about" element={<About />} />
+      <Route path="/archive" element={<Archive />} />
+      <Route path="/subscribe/confirm" element={<Confirm />} />
+      <Route path="/unsubscribe" element={<Unsubscribe />} />
+      <Route path="/admin/about" element={<RequireAdmin><AboutEdit /></RequireAdmin>} />
       <Route path="/topic/:topic" element={<Home />} />
+      <Route path="/admin/security" element={<RequireAdmin><Security /></RequireAdmin>} />
       <Route path="/admin/topics" element={<RequireAdmin><Topics /></RequireAdmin>} />
       <Route path="/post/:slug" element={<Post />} />
       <Route path="/admin/login" element={<Login />} />

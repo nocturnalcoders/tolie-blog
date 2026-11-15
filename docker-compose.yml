@@ -37,6 +37,7 @@ services:
       BLOG_SMTP_USER: ${BLOG_SMTP_USER:-}
       BLOG_SMTP_PASSWORD: ${BLOG_SMTP_PASSWORD:-}
       BLOG_NOTIFY_EMAIL: ${BLOG_NOTIFY_EMAIL:-}
+      BLOG_MAIL_FROM: ${BLOG_MAIL_FROM:-}
     volumes:
       - uploads:/data/uploads
     healthcheck:

@@ -4,6 +4,7 @@ import Prose from '../components/Prose.jsx';
 import Reactions from '../components/Reactions.jsx';
 import Comments from '../components/Comments.jsx';
 import Share from '../components/Share.jsx';
+import Subscribe from '../components/Subscribe.jsx';
 import NotFound from './NotFound.jsx';
 import { useApi, useDocumentTitle } from '../hooks.js';
 import { formatDate } from '../utils.js';
@@ -77,6 +78,7 @@ export default function Post() {
               </div>
             </section>
           )}
+          {post.status === 'published' && <Subscribe />}
           {post.status === 'published' && <Comments key={`comments-${post.slug}`} slug={post.slug} />}
           <nav className="pager two" aria-label="More notes">
             {data.prev ? <Link className="btn" to={`/post/${data.prev.slug}`}>← {data.prev.title.length > 34 ? `${data.prev.title.slice(0, 33)}…` : data.prev.title}</Link> : <span />}

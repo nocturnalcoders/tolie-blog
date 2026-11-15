@@ -6,3 +6,4 @@ gunicorn>=21.2
 psycopg[binary,pool]>=3.2
 Pillow>=10.4
 maxminddb>=2.6
+segno>=1.6

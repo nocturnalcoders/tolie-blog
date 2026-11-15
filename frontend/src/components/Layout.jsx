@@ -17,8 +17,9 @@ export default function Layout({ children, wide = false }) {
         <Link className="brand" to="/">tolie.space<small>/ notes</small></Link>
         <nav className="lanterns" aria-label="Main">
           <Link className="lantern" to="/"><i className="body"><em>~</em></i><span>Notes</span></Link>
+          <Link className="lantern l-coral" to="/archive"><i className="body"><em>≡</em></i><span>Archive</span></Link>
+          <Link className="lantern l-violet" to="/about"><i className="body"><em>hi</em></i><span>About</span></Link>
           <a className="lantern l-teal" href={MAIN_URL}><i className="body"><em>&gt;_</em></i><span>The game</span></a>
-          <a className="lantern l-coral" href={GITHUB_URL} target="_blank" rel="noopener noreferrer"><i className="body"><em>&lt;/&gt;</em></i><span>GitHub</span></a>
         </nav>
         <button
           className="theme-btn"

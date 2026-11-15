@@ -90,6 +90,11 @@ docker run --rm -v tolie-blog_uploads:/data -v "$PWD/backups:/in:ro" alpine \
 ## Comments, traffic and sharing
 
 - New comments wait for you at `/admin/comments`. Traffic is at `/admin/stats`.
+- Email: once SMTP is set in `.env`, readers can subscribe to new notes (double opt-in, optional topics,
+  one-click unsubscribe), and commenters can ask to hear about replies. Each note is mailed once, when it
+  goes out (scheduled notes too). Notes that were already out before this existed are never mailed.
+- Two-factor login is set up at `/admin/security`. Lost your phone and the recovery codes? On the droplet:
+  `docker compose exec api python manage.py disable-2fa`, then sign in with your password.
 - Topics (the few big sections on the home page, one per note) are managed at `/admin/topics`.
   The first deploy creates Software, Security, Hardware, Football, Anime & Books and Life once.
 - To get a message for every new comment, add the Telegram and/or email settings from

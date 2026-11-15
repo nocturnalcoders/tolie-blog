@@ -4,11 +4,15 @@ The React frontend (../frontend) talks to this API. Public routes:
 
   GET  /api/posts?page=&q=&tag=&topic=   list published posts
   GET  /api/topics                   the topics (Software, Security, ...) with post counts
+  GET  /api/archive                  every published post, newest first (title, date, topic)
+  GET  /api/about                    the About page
   GET  /api/tags?limit=               tags with counts (most used first), and how many there are
   GET  /api/posts/<slug>             one post (rendered HTML)
   GET/POST /api/posts/<slug>/comments    approved comments / leave one (held for review)
   GET/POST /api/posts/<slug>/reactions   reaction counts / toggle one
   POST /api/track                    count a page view (no cookies, no raw IPs stored)
+  POST /api/subscribe  /api/subscribe/confirm  /api/unsubscribe   new posts by email (double opt-in)
+  POST /api/comments/stop            stop reply emails for a comment
   GET  /feed.xml  /sitemap.xml  /robots.txt  /healthz  /uploads/<file>
   GET  /og/<slug>/card.png  /og/<slug>/story.png   share pictures (link preview, Instagram/TikTok story)
   GET  /post/<slug>                  the React shell with SEO meta tags filled in
@@ -23,6 +27,9 @@ Admin routes need a signed-in session and a CSRF header:
   GET  /api/admin/comments?status=   PUT/DELETE /api/admin/comments/<id>
   GET  /api/admin/stats?days=7|30|90 traffic summary
   GET/POST /api/admin/topics   PUT/DELETE /api/admin/topics/<id>   POST /api/admin/topics/order
+  POST /api/admin/posts/topic        set the topic of several posts at once
+  GET/PUT /api/admin/about           edit the About page
+  GET  /api/admin/2fa   POST /api/admin/2fa/setup|enable|disable   two-factor login
 
 Configuration comes from environment variables (docker-compose.yml sets them).
 New comments can be announced on Telegram and/or by email (see .env.example).
@@ -31,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import hashlib
 import hmac
 import html as html_lib
@@ -54,6 +62,7 @@ from xml.sax.saxutils import escape as xml_escape
 import markdown as md
 import maxminddb
 import nh3
+import segno
 import psycopg
 from flask import (Flask, Response, abort, g, jsonify, request,
                    send_from_directory, session)
@@ -116,6 +125,9 @@ SMTP_PORT = int(os.environ.get("BLOG_SMTP_PORT", "587") or 587)
 SMTP_USER = os.environ.get("BLOG_SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("BLOG_SMTP_PASSWORD", "")
 NOTIFY_EMAIL = os.environ.get("BLOG_NOTIFY_EMAIL", "")
+MAIL_FROM = os.environ.get("BLOG_MAIL_FROM", "") or (SMTP_USER if "@" in SMTP_USER else NOTIFY_EMAIL)
+BACKGROUND = os.environ.get("BLOG_BACKGROUND", "1") != "0"  # the tests switch threads off
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 PER_PAGE = 8
 MAX_UPLOAD = 15 * 1024 * 1024  # phone photos are big; they are shrunk on upload
 MAX_IMAGE_WIDTH = 1600
@@ -205,6 +217,29 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS announced_at TIMESTAMPTZ;
+ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id BIGINT REFERENCES comments (id) ON DELETE CASCADE;
+ALTER TABLE comments ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '';
+ALTER TABLE comments ADD COLUMN IF NOT EXISTS notify_token TEXT;
+CREATE TABLE IF NOT EXISTS subscribers (
+  id           BIGSERIAL PRIMARY KEY,
+  email        TEXT NOT NULL UNIQUE,
+  topics       TEXT[] NOT NULL DEFAULT '{}',
+  token        TEXT NOT NULL UNIQUE,
+  ip           TEXT NOT NULL DEFAULT '',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  confirmed_at TIMESTAMPTZ,
+  last_sent_at TIMESTAMPTZ
+);
+"""
+
+ABOUT_DEFAULT = """Hi, I'm **Christianto Lie**, a senior software engineer.
+
+I play futsal, walk around the city at night, and write here about software, security,
+hardware, football, anime and books, and whatever I am learning.
+
+Say hi in [the little town](https://tolie.space), on [GitHub](https://github.com/nocturnalcoders)
+or on [LinkedIn](https://www.linkedin.com/in/christianto-lie).
 """
 
 # The first topics. Created once; after that they are managed on /admin/topics.
@@ -285,6 +320,11 @@ def init_db() -> None:
                     for i, name in enumerate(SEED_TOPICS):
                         conn.execute("INSERT INTO topics (slug, name, position) VALUES (%s, %s, %s)"
                                      " ON CONFLICT (slug) DO NOTHING", (slugify(name), name, i))
+                # Posts that were out before email updates existed are never mailed.
+                if conn.execute("INSERT INTO meta (key, value) VALUES ('announce_baseline', '1')"
+                                " ON CONFLICT DO NOTHING").rowcount:
+                    conn.execute("UPDATE posts SET announced_at = now()"
+                                 " WHERE status = 'published' AND published_at <= now()")
             break
         except psycopg.OperationalError as exc:
             last_error = exc
@@ -399,7 +439,15 @@ def summary(row: dict, admin: bool = False) -> dict:
         data["status"] = row["status"]
         data["updated_at"] = iso(row["updated_at"])
         data["topic_id"] = row.get("topic_id")
+        data["scheduled"] = row["status"] == "published" and not is_live(row)
+        data["publish_at"] = iso(row["published_at"])
     return data
+
+
+def is_live(row: dict) -> bool:
+    """Published, and its time has come (a scheduled post stays hidden until then)."""
+    return (row["status"] == "published" and row["published_at"] is not None
+            and row["published_at"] <= datetime.now(timezone.utc))
 
 
 def topics_by_id() -> dict:
@@ -480,7 +528,7 @@ def clear_failures(ip: str) -> None:
 # --------------------------------------------------------------------------
 @app.get("/api/session")
 def api_session():
-    return jsonify(admin=is_admin(), csrf=csrf_token(), configured=bool(ADMIN_HASH))
+    return jsonify(admin=is_admin(), csrf=csrf_token(), configured=bool(ADMIN_HASH), mail=mail_enabled())
 
 
 @app.post("/api/login")
@@ -495,6 +543,13 @@ def api_login():
     ok_pw = check_password_hash(ADMIN_HASH or DUMMY_HASH, password)
     ok_user = hmac.compare_digest(user.encode("utf-8"), ADMIN_USER.encode("utf-8"))
     if ADMIN_HASH and ok_pw and ok_user:
+        if meta_get("totp_secret"):
+            code = str(payload.get("code", "")).strip()
+            if not code:
+                return jsonify(error="Enter the 6-digit code from your authenticator app.", need_code=True), 401
+            if not check_second_factor(code):
+                record_failure(ip)
+                return jsonify(error="That code didn't work. Codes change every 30 seconds.", need_code=True), 401
         session.clear()
         session["admin"] = True
         session.permanent = True
@@ -502,6 +557,109 @@ def api_login():
         return jsonify(admin=True, csrf=csrf_token())
     record_failure(ip)
     return jsonify(error="That username or password didn't match."), 401
+
+
+# --------------------------------------------------------------------------
+# Two-factor login: a 6-digit code from an authenticator app (TOTP, RFC 6238),
+# or one of the one-time recovery codes. Lost both? On the server:
+#   docker compose exec api python manage.py disable-2fa
+# --------------------------------------------------------------------------
+def meta_get(key: str) -> str | None:
+    row = db().execute("SELECT value FROM meta WHERE key = %s", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def meta_set(key: str, value: str) -> None:
+    db().execute("INSERT INTO meta (key, value) VALUES (%s, %s)"
+                 " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+    db().commit()
+
+
+def totp_at(secret: str, step: int) -> str:
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    digest = hmac.new(key, step.to_bytes(8, "big"), hashlib.sha1).digest()
+    offset = digest[-1] & 15
+    return f"{(int.from_bytes(digest[offset:offset + 4], 'big') & 0x7FFFFFFF) % 1_000_000:06d}"
+
+
+def totp_step(secret: str, code: str, after: int = -1) -> int | None:
+    """The time step the code belongs to (allowing 30 s of clock drift), or None."""
+    now = int(time.time() // 30)
+    for step in (now - 1, now, now + 1):
+        if step > after and hmac.compare_digest(totp_at(secret, step), code):
+            return step
+    return None
+
+
+def recovery_hash(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()
+
+
+def check_second_factor(raw: str) -> bool:
+    secret = meta_get("totp_secret")
+    code = re.sub(r"[\s-]", "", raw).lower()
+    if not secret:
+        return False
+    if re.fullmatch(r"\d{6}", code):
+        step = totp_step(secret, code, int(meta_get("totp_last_step") or -1))  # each code works once
+        if step is None:
+            return False
+        meta_set("totp_last_step", str(step))
+        return True
+    left = json.loads(meta_get("totp_recovery") or "[]")
+    if recovery_hash(code) in left:
+        left.remove(recovery_hash(code))
+        meta_set("totp_recovery", json.dumps(left))
+        return True
+    return False
+
+
+@app.get("/api/admin/2fa")
+@admin_required
+def admin_2fa():
+    return jsonify(enabled=bool(meta_get("totp_secret")), recovery_left=len(json.loads(meta_get("totp_recovery") or "[]")))
+
+
+@app.post("/api/admin/2fa/setup")
+@admin_required
+def admin_2fa_setup():
+    if meta_get("totp_secret"):
+        return jsonify(error="Two-factor login is already on."), 400
+    secret = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+    session["totp_pending"] = secret
+    label = urllib.parse.quote(f"tolie.space notes:{ADMIN_USER}")
+    uri = f"otpauth://totp/{label}?secret={secret}&issuer=tolie.space%20notes"
+    return jsonify(secret=secret, uri=uri, qr=segno.make(uri, error="m").svg_data_uri(scale=5))
+
+
+@app.post("/api/admin/2fa/enable")
+@admin_required
+def admin_2fa_enable():
+    secret = session.get("totp_pending")
+    code = re.sub(r"\s", "", str((request.get_json(silent=True) or {}).get("code", "")))
+    if not secret:
+        return jsonify(error="Start the setup again."), 400
+    step = totp_step(secret, code) if re.fullmatch(r"\d{6}", code) else None
+    if step is None:
+        return jsonify(error="That code didn't work. Check the time on your phone and try the newest code."), 400
+    codes = [secrets.token_hex(5) for _ in range(8)]
+    meta_set("totp_secret", secret)
+    meta_set("totp_last_step", str(step))
+    meta_set("totp_recovery", json.dumps([recovery_hash(c) for c in codes]))
+    session.pop("totp_pending", None)
+    return jsonify(enabled=True, recovery_codes=[f"{c[:5]}-{c[5:]}" for c in codes])
+
+
+@app.post("/api/admin/2fa/disable")
+@admin_required
+def admin_2fa_disable():
+    if not meta_get("totp_secret"):
+        return jsonify(error="Two-factor login is already off."), 400
+    if not check_second_factor(str((request.get_json(silent=True) or {}).get("code", ""))):
+        return jsonify(error="That code didn't work."), 400
+    db().execute("DELETE FROM meta WHERE key LIKE 'totp\\_%'")
+    db().commit()
+    return jsonify(enabled=False)
 
 
 @app.post("/api/logout")
@@ -528,7 +686,7 @@ def api_posts():
     tag = re.sub(r"[^a-z0-9\-+#]", "", (request.args.get("tag") or "").lower())
     topic = re.sub(r"[^a-z0-9-]", "", (request.args.get("topic") or "").lower())
     page = max(1, request.args.get("page", type=int) or 1)
-    where, args = "status = 'published'", []
+    where, args = "status = 'published' AND published_at <= now()", []
     if q:
         like = f"%{like_escape(q)}%"
         where += (" AND (title ILIKE %s ESCAPE '\\' OR body_md ILIKE %s ESCAPE '\\'"
@@ -550,9 +708,32 @@ def api_posts():
 def api_topics():
     rows = db().execute(
         "SELECT t.slug, t.name, COUNT(p.id) AS count FROM topics t"
-        " LEFT JOIN posts p ON p.topic_id = t.id AND p.status = 'published'"
+        " LEFT JOIN posts p ON p.topic_id = t.id AND p.status = 'published' AND p.published_at <= now()"
         " GROUP BY t.id ORDER BY t.position, t.id").fetchall()
     resp = jsonify(topics=[{"slug": r["slug"], "name": r["name"], "count": r["count"]} for r in rows])
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/archive")
+def api_archive():
+    rows = db().execute(
+        "SELECT slug, title, published_at, topic_id FROM posts WHERE status = 'published' AND published_at <= now()"
+        " ORDER BY published_at DESC, id DESC").fetchall()
+    resp = jsonify(posts=[{"slug": r["slug"], "title": r["title"], "date": iso(r["published_at"]),
+                           "topic": topics_by_id().get(r["topic_id"])} for r in rows])
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+def about_md() -> str:
+    row = db().execute("SELECT value FROM meta WHERE key = 'about_md'").fetchone()
+    return row["value"] if row else ABOUT_DEFAULT
+
+
+@app.get("/api/about")
+def api_about():
+    resp = jsonify(html=render_md(about_md()))
     resp.headers["Cache-Control"] = "no-cache"
     return resp
 
@@ -562,7 +743,7 @@ def api_tags():
     limit = request.args.get("limit", type=int)
     rows = db().execute(
         "SELECT t AS tag, COUNT(*) AS count, COUNT(*) OVER () AS total FROM posts, unnest(tags) AS t"
-        " WHERE status = 'published' GROUP BY t ORDER BY count DESC, t LIMIT %s",
+        " WHERE status = 'published' AND published_at <= now() GROUP BY t ORDER BY count DESC, t LIMIT %s",
         (limit if limit and limit > 0 else None,)).fetchall()
     total = rows[0]["total"] if rows else 0
     resp = jsonify(tags=[{"tag": r["tag"], "count": r["count"]} for r in rows], total=total)
@@ -573,24 +754,24 @@ def api_tags():
 @app.get("/api/posts/<slug>")
 def api_post(slug: str):
     row = db().execute("SELECT * FROM posts WHERE slug = %s", (slug,)).fetchone()
-    if row is None or (row["status"] != "published" and not is_admin()):
+    if row is None or (not is_live(row) and not is_admin()):
         return jsonify(error="That note doesn't exist, or it hasn't been published yet."), 404
     post = summary(row, admin=True)
     post["html"], post["toc"] = render_post(row["body_md"])
     prev_row = nxt_row = None
     related: list[dict] = []
-    if row["status"] == "published":
+    if is_live(row):
         key = (row["published_at"], row["id"])
         prev_row = db().execute(
-            "SELECT slug, title FROM posts WHERE status = 'published' AND (published_at, id) < (%s, %s)"
+            "SELECT slug, title FROM posts WHERE status = 'published' AND published_at <= now() AND (published_at, id) < (%s, %s)"
             " ORDER BY published_at DESC, id DESC LIMIT 1", key).fetchone()
         nxt_row = db().execute(
-            "SELECT slug, title FROM posts WHERE status = 'published' AND (published_at, id) > (%s, %s)"
+            "SELECT slug, title FROM posts WHERE status = 'published' AND published_at <= now() AND (published_at, id) > (%s, %s)"
             " ORDER BY published_at ASC, id ASC LIMIT 1", key).fetchone()
         # Read next: the most shared tags first, then the newest.
         related = [summary(r) for r in db().execute(
             "SELECT *, cardinality(ARRAY(SELECT unnest(tags) INTERSECT SELECT unnest(%s::text[]))) AS shared"
-            " FROM posts WHERE status = 'published' AND id <> %s"
+            " FROM posts WHERE status = 'published' AND published_at <= now() AND id <> %s"
             " ORDER BY shared DESC, published_at DESC, id DESC LIMIT 3", (list(row["tags"]), row["id"])).fetchall()]
     resp = jsonify(post=post, prev=prev_row, next=nxt_row, related=related)
     resp.headers["Cache-Control"] = "no-cache"
@@ -601,15 +782,15 @@ def api_post(slug: str):
 # Comments and reactions
 # --------------------------------------------------------------------------
 def published_post_id(slug: str) -> int | None:
-    row = db().execute("SELECT id FROM posts WHERE slug = %s AND status = 'published'", (slug,)).fetchone()
+    row = db().execute("SELECT id FROM posts WHERE slug = %s AND status = 'published' AND published_at <= now()", (slug,)).fetchone()
     return row["id"] if row else None
 
 
 def comment_json(row: dict, admin: bool = False) -> dict:
-    data = {"id": row["id"], "author": row["author"], "body": row["body"],
+    data = {"id": row["id"], "author": row["author"], "body": row["body"], "parent_id": row["parent_id"],
             "by_author": row["by_author"], "date": iso(row["created_at"])}
     if admin:
-        data.update(status=row["status"], post_slug=row["slug"], post_title=row["title"])
+        data.update(status=row["status"], post_slug=row["slug"], post_title=row["title"], reply_to=row["reply_to"])
     return data
 
 
@@ -642,6 +823,17 @@ def api_comment_create(slug: str):
         return jsonify(error="Add your name (60 characters at most)."), 400
     if len(body) < 2 or len(body) > 3000:
         return jsonify(error="Write a comment between 2 and 3000 characters."), 400
+    parent_id = payload.get("parent_id") if isinstance(payload.get("parent_id"), int) else None
+    if parent_id is not None:
+        parent = db().execute("SELECT id, parent_id FROM comments WHERE id = %s AND post_id = %s AND status = 'approved'",
+                              (parent_id, pid)).fetchone()
+        if parent is None:
+            return jsonify(error="That comment can't be replied to any more."), 400
+        parent_id = parent["parent_id"] or parent["id"]  # replies stay one level deep
+    email = "" if admin else str(payload.get("email", "")).strip().lower()
+    if email and (len(email) > 254 or not EMAIL_RE.fullmatch(email)):
+        return jsonify(error="That email address doesn't look right. It's optional, so you can leave it empty."), 400
+    notify_token = secrets.token_urlsafe(24) if email and payload.get("notify") else None
     ip = request.remote_addr or "?"
     if not admin:
         recent = db().execute(
@@ -651,11 +843,13 @@ def api_comment_create(slug: str):
         if recent >= 3:
             return jsonify(error="You've left a few comments already. Try again in a few minutes."), 429
     row = db().execute(
-        "INSERT INTO comments (post_id, author, body, by_author, status, ip) VALUES (%s, %s, %s, %s, %s, %s)"
-        " RETURNING *",
-        (pid, author, body, admin, "approved" if admin else "pending", ip)).fetchone()
+        "INSERT INTO comments (post_id, author, body, by_author, status, ip, parent_id, email, notify_token)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+        (pid, author, body, admin, "approved" if admin else "pending", ip, parent_id, email,
+         notify_token)).fetchone()
     db().commit()
     if admin:
+        background(notify_reply, row["id"])
         return jsonify(pending=False, comment=comment_json(row)), 201
     title = db().execute("SELECT title FROM posts WHERE id = %s", (pid,)).fetchone()["title"]
     notify(f"New comment on “{title}” from {author}",
@@ -678,20 +872,178 @@ def deliver(subject: str, text: str) -> None:
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data=data, timeout=10).read()
         except Exception as exc:
             app.logger.warning("Telegram notification failed: %s", exc)
-    if SMTP_HOST and NOTIFY_EMAIL:
+    if NOTIFY_EMAIL:
+        send_email(NOTIFY_EMAIL, subject, text)
+
+
+def mail_enabled() -> bool:
+    return bool(SMTP_HOST and MAIL_FROM)
+
+
+def send_email(to: str, subject: str, text: str, headers: dict | None = None) -> bool:
+    if not mail_enabled():
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"], msg["To"], msg["From"] = subject, to, f"tolie.space notes <{MAIL_FROM}>"
+        for key, value in (headers or {}).items():
+            msg[key] = value
+        msg.set_content(text)
+        with (smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP)(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            if SMTP_PORT != 465:
+                smtp.starttls()
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+        return True
+    except Exception as exc:
+        app.logger.warning("Email to %s failed: %s", to, exc)
+        return False
+
+
+def background(fn, *args) -> None:
+    """Run slow work (sending mail) after the response, so nobody waits for it."""
+    if not BACKGROUND:
+        fn(*args)
+        return
+
+    def run() -> None:
         try:
-            msg = EmailMessage()
-            msg["Subject"], msg["To"] = subject, NOTIFY_EMAIL
-            msg["From"] = SMTP_USER if "@" in SMTP_USER else NOTIFY_EMAIL
-            msg.set_content(text)
-            with (smtplib.SMTP_SSL if SMTP_PORT == 465 else smtplib.SMTP)(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
-                if SMTP_PORT != 465:
-                    smtp.starttls()
-                if SMTP_USER:
-                    smtp.login(SMTP_USER, SMTP_PASSWORD)
-                smtp.send_message(msg)
+            fn(*args)
         except Exception as exc:
-            app.logger.warning("Email notification failed: %s", exc)
+            app.logger.warning("Background job %s failed: %s", fn.__name__, exc)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def notify_reply(cid: int) -> None:
+    """Tell someone that their comment got a reply, if they asked for that."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT c.author, c.body, c.email, pc.email AS parent_email, pc.notify_token, po.slug, po.title"
+            " FROM comments c JOIN comments pc ON pc.id = c.parent_id JOIN posts po ON po.id = c.post_id"
+            " WHERE c.id = %s AND c.status = 'approved'", (cid,)).fetchone()
+    if not row or not row["notify_token"] or not row["parent_email"] or row["parent_email"] == row["email"]:
+        return
+    stop = f"{SITE_URL}/unsubscribe?replies={row['notify_token']}"
+    send_email(row["parent_email"], f"{row['author']} replied to your comment on “{row['title']}”",
+               f"{row['author']} wrote:\n\n{row['body'][:2000]}\n\nRead the conversation: {SITE_URL}/post/{row['slug']}"
+               f"#comments\n\n—\nYou asked to hear about replies to your comment. Stop these emails: {stop}",
+               {"List-Unsubscribe": f"<{SITE_URL}/api/comments/stop?token={row['notify_token']}>",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"})
+
+
+@app.post("/api/comments/stop")
+def api_comments_stop():
+    token = request.args.get("token") or str((request.get_json(silent=True) or {}).get("token", ""))
+    db().execute("UPDATE comments SET notify_token = NULL WHERE notify_token = %s", (token,))
+    db().commit()
+    return jsonify(ok=True)
+
+
+# --------------------------------------------------------------------------
+# Email updates: double opt-in, one-click unsubscribe, and a small sender that
+# mails each post once, when its time has come (scheduled posts included).
+# --------------------------------------------------------------------------
+def unsubscribe_footer(token: str) -> tuple[str, dict]:
+    link = f"{SITE_URL}/unsubscribe?token={token}"
+    return (f"\n\n—\nYou get these because you subscribed on {SITE_URL}. Unsubscribe: {link}",
+            {"List-Unsubscribe": f"<{SITE_URL}/api/unsubscribe?token={token}>",
+             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"})
+
+
+@app.post("/api/subscribe")
+def api_subscribe():
+    check_csrf()
+    if not mail_enabled():
+        return jsonify(error="Email updates aren't switched on yet."), 503
+    payload = request.get_json(silent=True) or {}
+    if str(payload.get("website", "")).strip():  # honeypot
+        return jsonify(ok=True)
+    email = str(payload.get("email", "")).strip().lower()
+    if len(email) > 254 or not EMAIL_RE.fullmatch(email):
+        return jsonify(error="That email address doesn't look right."), 400
+    known = {t["slug"] for t in topics_by_id().values()}
+    wanted = payload.get("topics") if isinstance(payload.get("topics"), list) else []
+    topics = sorted({t for t in wanted if isinstance(t, str) and t in known})
+    ip = request.remote_addr or "?"
+    recent = db().execute("SELECT COUNT(*) AS n FROM subscribers WHERE ip = %s AND created_at > now() - interval '1 hour'",
+                          (ip,)).fetchone()["n"]
+    if recent >= 5:
+        return jsonify(error="Too many sign-ups from here. Try again later."), 429
+    row = db().execute("SELECT * FROM subscribers WHERE email = %s", (email,)).fetchone()
+    # The answer is the same whether the address is new, waiting, or already in, so nobody can probe the list.
+    if row and (row["confirmed_at"] or (row["last_sent_at"] and
+                                        row["last_sent_at"] > datetime.now(timezone.utc) - timedelta(minutes=10))):
+        return jsonify(ok=True)
+    if row:
+        token = row["token"]
+        db().execute("UPDATE subscribers SET topics = %s, last_sent_at = now() WHERE id = %s", (topics, row["id"]))
+    else:
+        token = secrets.token_urlsafe(24)
+        db().execute("INSERT INTO subscribers (email, topics, token, ip, last_sent_at) VALUES (%s, %s, %s, %s, now())",
+                     (email, topics, token, ip))
+    db().commit()
+    names = ", ".join(t["name"] for t in topics_by_id().values() if t["slug"] in topics) or "every topic"
+    background(send_email, email, "Confirm your email for tolie.space notes",
+               f"Someone (hopefully you) asked to get new notes from {SITE_URL} by email ({names}).\n\n"
+               f"Confirm here: {SITE_URL}/subscribe/confirm?token={token}\n\n"
+               "If it wasn't you, ignore this email and nothing will happen.")
+    return jsonify(ok=True)
+
+
+@app.post("/api/subscribe/confirm")
+def api_subscribe_confirm():
+    token = str((request.get_json(silent=True) or {}).get("token", ""))
+    row = db().execute("UPDATE subscribers SET confirmed_at = COALESCE(confirmed_at, now()) WHERE token = %s"
+                       " RETURNING topics", (token,)).fetchone()
+    db().commit()
+    if row is None:
+        return jsonify(error="That link has expired. Sign up again and you'll get a new one."), 404
+    return jsonify(ok=True, topics=list(row["topics"]))
+
+
+@app.post("/api/unsubscribe")
+def api_unsubscribe():
+    # No CSRF: the token is the secret, and mail apps post here for one-click unsubscribe.
+    token = request.args.get("token") or str((request.get_json(silent=True) or {}).get("token", ""))
+    db().execute("DELETE FROM subscribers WHERE token = %s", (token,))
+    db().commit()
+    return jsonify(ok=True)
+
+
+def announce_due() -> int:
+    """Mail confirmed subscribers about posts that went live and weren't announced yet. Returns emails sent."""
+    with pool.connection() as conn:
+        with conn.transaction():
+            if not conn.execute("SELECT pg_try_advisory_xact_lock(727002) AS ok").fetchone()["ok"]:
+                return 0  # another worker is on it
+            conn.execute("DELETE FROM subscribers WHERE confirmed_at IS NULL AND created_at < now() - interval '7 days'")
+            posts = conn.execute(
+                "UPDATE posts SET announced_at = now() WHERE status = 'published' AND published_at <= now()"
+                " AND announced_at IS NULL RETURNING slug, title, excerpt, topic_id").fetchall()
+        if not posts or not mail_enabled():
+            return 0
+        slugs = {r["id"]: r["slug"] for r in conn.execute("SELECT id, slug FROM topics").fetchall()}
+        subs = conn.execute("SELECT email, topics, token FROM subscribers WHERE confirmed_at IS NOT NULL").fetchall()
+    sent = 0
+    for post in posts:
+        topic = slugs.get(post["topic_id"])
+        for sub in subs:
+            if sub["topics"] and topic not in sub["topics"]:
+                continue
+            footer, headers = unsubscribe_footer(sub["token"])
+            text = f"{post['title']}\n\n{post['excerpt']}\n\nRead it: {SITE_URL}/post/{post['slug']}{footer}"
+            sent += send_email(sub["email"], post["title"], text, headers)
+    return sent
+
+
+def announcer() -> None:
+    while True:
+        time.sleep(60)
+        try:
+            announce_due()
+        except Exception as exc:
+            app.logger.warning("Announcing new posts failed: %s", exc)
 
 
 def voter_id() -> str:
@@ -859,7 +1211,16 @@ def read_payload() -> dict:
         "body_md": str(data.get("body", "")).replace("\r\n", "\n")[:200000],
         "action": str(data.get("action", "draft")),
         "topic_id": data.get("topic_id") if isinstance(data.get("topic_id"), int) else None,
+        "publish_at": parse_when(data.get("publish_at")),
     }
+
+
+def parse_when(value) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else None
 
 
 @app.route("/api/admin/posts", methods=["POST"])
@@ -879,22 +1240,33 @@ def admin_save(pid: int | None = None):
     slug = unique_slug(slugify(form["slug"] or form["title"]), ignore_id=pid)
     excerpt = form["excerpt"] or auto_excerpt(form["body_md"])
     action = form["action"]
+    now = datetime.now(timezone.utc)
+    was = existing["published_at"] if existing else None
+    if action == "schedule":
+        if form["publish_at"] is None or form["publish_at"] <= now + timedelta(minutes=1):
+            return jsonify(error="Pick a date and time in the future to publish."), 400
+        status, when = "published", form["publish_at"]
+    elif action == "publish":  # now; a post that was already out keeps its date
+        status, when = "published", was if was and was <= now else now
+    elif action == "draft" or not existing:
+        status, when = "draft", was
+    else:  # "save": keep status and date
+        status, when = existing["status"], was
     if existing:
-        status = {"publish": "published", "draft": "draft"}.get(action, existing["status"])
         row = db().execute(
             """UPDATE posts SET slug=%s, title=%s, excerpt=%s, body_md=%s, tags=%s, topic_id=%s, status=%s,
-                 updated_at=now(), published_at = COALESCE(published_at, CASE WHEN %s = 'published' THEN now() END)
-               WHERE id=%s RETURNING *""",
-            (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status, status,
+                 updated_at=now(), published_at=%s WHERE id=%s RETURNING *""",
+            (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status, when,
              pid)).fetchone()
     else:
-        status = "published" if action == "publish" else "draft"
         row = db().execute(
             """INSERT INTO posts (slug, title, excerpt, body_md, tags, topic_id, status, published_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s = 'published' THEN now() END) RETURNING *""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
             (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status,
-             status)).fetchone()
+             when)).fetchone()
     db().commit()
+    if is_live(row) and row["announced_at"] is None:
+        background(announce_due)
     post = summary(row, admin=True)
     post["body"] = row["body_md"]
     return jsonify(post=post), (200 if existing else 201)
@@ -965,6 +1337,36 @@ def admin_topic_delete(tid: int):
     return jsonify(topics=topic_rows())
 
 
+@app.post("/api/admin/posts/topic")
+@admin_required
+def admin_posts_topic():
+    data = request.get_json(silent=True) or {}
+    ids, topic_id = data.get("ids"), data.get("topic_id")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, int) for i in ids):
+        return jsonify(error="Pick at least one note."), 400
+    if topic_id is not None and (not isinstance(topic_id, int) or topic_id not in topics_by_id()):
+        return jsonify(error="That topic doesn't exist any more. Pick another one."), 400
+    n = db().execute("UPDATE posts SET topic_id = %s WHERE id = ANY(%s)", (topic_id, ids)).rowcount
+    db().commit()
+    return jsonify(updated=n)
+
+
+@app.get("/api/admin/about")
+@admin_required
+def admin_about():
+    return jsonify(body=about_md())
+
+
+@app.put("/api/admin/about")
+@admin_required
+def admin_about_save():
+    body = str((request.get_json(silent=True) or {}).get("body", "")).replace("\r\n", "\n")[:50000]
+    db().execute("INSERT INTO meta (key, value) VALUES ('about_md', %s)"
+                 " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (body,))
+    db().commit()
+    return jsonify(body=body, html=render_md(body))
+
+
 @app.delete("/api/admin/posts/<int:pid>")
 @admin_required
 def admin_delete(pid: int):
@@ -980,7 +1382,8 @@ def admin_comments():
     if status not in ("pending", "approved"):
         status = "pending"
     rows = db().execute(
-        "SELECT c.*, p.slug, p.title FROM comments c JOIN posts p ON p.id = c.post_id"
+        "SELECT c.*, p.slug, p.title, pc.author AS reply_to FROM comments c JOIN posts p ON p.id = c.post_id"
+        " LEFT JOIN comments pc ON pc.id = c.parent_id"
         " WHERE c.status = %s ORDER BY c.created_at DESC, c.id DESC LIMIT 200", (status,)).fetchall()
     pending = db().execute("SELECT COUNT(*) AS n FROM comments WHERE status = 'pending'").fetchone()["n"]
     return jsonify(comments=[comment_json(r, admin=True) for r in rows], pending=pending)
@@ -989,10 +1392,13 @@ def admin_comments():
 @app.put("/api/admin/comments/<int:cid>")
 @admin_required
 def admin_comment_approve(cid: int):
-    row = db().execute("UPDATE comments SET status = 'approved' WHERE id = %s RETURNING id", (cid,)).fetchone()
-    db().commit()
+    row = db().execute("SELECT status FROM comments WHERE id = %s", (cid,)).fetchone()
     if row is None:
         return jsonify(error="Comment not found."), 404
+    if row["status"] == "pending":  # approving twice must not mail twice
+        db().execute("UPDATE comments SET status = 'approved' WHERE id = %s", (cid,))
+        db().commit()
+        background(notify_reply, cid)
     return jsonify(ok=True)
 
 
@@ -1039,6 +1445,7 @@ def admin_stats():
         referrers=[{"host": r["referrer"], "views": r["views"]} for r in refs],
         devices=[{"device": r["device"], "views": r["views"]} for r in devices],
         countries=[{"country": r["country"], "views": r["views"]} for r in countries],
+        subscribers=db().execute("SELECT COUNT(*) AS n FROM subscribers WHERE confirmed_at IS NOT NULL").fetchone()["n"],
         geoip=GEOIP_DB.exists())
 
 
@@ -1111,7 +1518,7 @@ def admin_upload():
 @app.get("/feed.xml")
 def feed():
     rows = db().execute(
-        "SELECT * FROM posts WHERE status = 'published' ORDER BY published_at DESC, id DESC LIMIT 20").fetchall()
+        "SELECT * FROM posts WHERE status = 'published' AND published_at <= now() ORDER BY published_at DESC, id DESC LIMIT 20").fetchall()
     items = []
     for row in rows:
         link = f"{SITE_URL}/post/{row['slug']}"
@@ -1130,7 +1537,7 @@ def feed():
 @app.get("/sitemap.xml")
 def sitemap():
     rows = db().execute(
-        "SELECT slug, updated_at FROM posts WHERE status = 'published' ORDER BY published_at DESC").fetchall()
+        "SELECT slug, updated_at FROM posts WHERE status = 'published' AND published_at <= now() ORDER BY published_at DESC").fetchall()
     urls = [f"<url><loc>{xml_escape(SITE_URL)}/</loc></url>"]
     for row in rows:
         urls.append(f"<url><loc>{xml_escape(SITE_URL)}/post/{xml_escape(row['slug'])}</loc>"
@@ -1158,7 +1565,7 @@ def healthz():
 def og_image(slug: str, kind: str):
     if kind not in share_image.SIZES:
         abort(404)
-    row = db().execute("SELECT * FROM posts WHERE slug = %s AND status = 'published'", (slug,)).fetchone()
+    row = db().execute("SELECT * FROM posts WHERE slug = %s AND status = 'published' AND published_at <= now()", (slug,)).fetchone()
     if row is None:
         abort(404)
     post = summary(row)
@@ -1240,8 +1647,9 @@ def post_shell(slug: str):
     shell = read_shell()
     if shell is None:
         return jsonify(error="The frontend isn't available yet."), 503
-    row = db().execute("SELECT slug, title, excerpt, status FROM posts WHERE slug = %s", (slug,)).fetchone()
-    if row is None or row["status"] != "published":
+    row = db().execute("SELECT slug, title, excerpt, status, published_at FROM posts WHERE slug = %s",
+                       (slug,)).fetchone()
+    if row is None or not is_live(row):
         return Response(shell, mimetype="text/html", status=404)
     page = inject_meta(shell, f"{row['title']} · tolie.space notes", row["excerpt"],
                        f"{SITE_URL}/post/{row['slug']}", "article", f"{SITE_URL}/og/{row['slug']}/card.png")
@@ -1279,6 +1687,8 @@ def too_large(_exc):
 
 
 init_db()
+if BACKGROUND:
+    threading.Thread(target=announcer, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8000, debug=False)

@@ -12,6 +12,8 @@ export default function Login() {
   const next = safeNext(params.get('next'));
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [needCode, setNeedCode] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   useDocumentTitle('Sign in · tolie.space notes');
@@ -25,9 +27,15 @@ export default function Login() {
     setBusy(true);
     setError('');
     try {
-      await login(username, password);
+      await login(username, password, needCode ? code : undefined);
     } catch (err) {
-      setError(err.message);
+      if (err.data && err.data.need_code) {
+        // The password was right; now the authenticator code. Don't show an error the first time.
+        if (needCode) setError(err.message);
+        setNeedCode(true);
+      } else {
+        setError(err.message);
+      }
     }
     setBusy(false);
   };
@@ -45,6 +53,12 @@ export default function Login() {
         <input id="username" type="text" autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} required />
         <label htmlFor="password">Password</label>
         <input id="password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+        {needCode && (
+          <>
+            <label htmlFor="code">Code from your authenticator app <small>(or a recovery code)</small></label>
+            <input id="code" type="text" inputMode="numeric" autoComplete="one-time-code" autoFocus value={code} onChange={(e) => setCode(e.target.value)} required />
+          </>
+        )}
         <p className="row"><button type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button></p>
       </form>
     </Layout>

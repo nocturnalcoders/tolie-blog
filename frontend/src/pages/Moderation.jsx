@@ -13,7 +13,8 @@ export default function Moderation() {
   useDocumentTitle('Comments · tolie.space notes');
 
   const act = async (comment, method, done) => {
-    if (method === 'DELETE' && !window.confirm(`Delete the comment from ${comment.author}?`)) return;
+    const replies = comment.reply_to ? '' : ' Replies to it are deleted too.';
+    if (method === 'DELETE' && !window.confirm(`Delete the comment from ${comment.author}?${replies}`)) return;
     try {
       await api(`/api/admin/comments/${comment.id}`, { method });
       setMessage(done);
@@ -51,7 +52,11 @@ export default function Moderation() {
             <tbody>
               {comments.map((c) => (
                 <tr key={c.id}>
-                  <td><b>{c.author}</b><p className="comment-body">{c.body}</p></td>
+                  <td>
+                    <b>{c.author}</b>
+                    {c.reply_to && <small className="reply-to"> ↳ reply to {c.reply_to}</small>}
+                    <p className="comment-body">{c.body}</p>
+                  </td>
                   <td><Link to={`/post/${c.post_slug}`}>{c.post_title}</Link></td>
                   <td>{formatDate(c.date)}</td>
                   <td className="acts">

@@ -8,6 +8,42 @@ import { useApi, useDocumentTitle } from '../hooks.js';
 const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '', topic_id: null };
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
+// Unsaved work is kept on this device, so a crash, a closed tab or an expired
+// sign-in never loses it. It is cleared once the server has the post.
+const draftKey = (id) => `tolie-draft:${id || 'new'}`;
+
+function readDraft(id) {
+  try {
+    return JSON.parse(localStorage.getItem(draftKey(id)) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function writeDraft(id, form) {
+  try {
+    localStorage.setItem(draftKey(id), JSON.stringify({ form, at: Date.now() }));
+  } catch {
+    /* storage full or blocked */
+  }
+}
+
+function dropDraft(id) {
+  try {
+    localStorage.removeItem(draftKey(id));
+  } catch {
+    /* blocked */
+  }
+}
+
+const sameForm = (a, b) => ['title', 'slug', 'tags', 'excerpt', 'body', 'topic_id'].every((k) => (a[k] ?? '') === (b[k] ?? ''));
+
+// <input type="datetime-local"> works in local time, without a zone.
+function localInput(date) {
+  const d = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return d.toISOString().slice(0, 16);
+}
+
 function fileSize(bytes) {
   return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
@@ -38,6 +74,10 @@ export default function Editor() {
   const [error, setError] = useState('');
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [scheduled, setScheduled] = useState(null); // Date when the post is waiting to go out
+  const [scheduling, setScheduling] = useState(false);
+  const [when, setWhen] = useState('');
+  const [restore, setRestore] = useState(null); // an unsaved draft found on this device
   const bodyRef = useRef(null);
   const fileRef = useRef(null);
   const caretRef = useRef(null); // where the cursor was last, since opening the file picker can lose it
@@ -47,10 +87,15 @@ export default function Editor() {
 
   // Load the post when editing.
   useEffect(() => {
+    setRestore(null);
+    setScheduled(null);
+    setScheduling(false);
     if (isNew) {
+      const saved = readDraft(null);
       setForm(EMPTY);
       setStatus('draft');
       setLoaded(true);
+      if (saved && !sameForm(saved.form, EMPTY)) setRestore(saved);
       return undefined;
     }
     let alive = true;
@@ -58,16 +103,28 @@ export default function Editor() {
     api(`/api/admin/posts/${id}`)
       .then(({ post }) => {
         if (!alive) return;
-        setForm({ title: post.title, slug: post.slug, tags: post.tags.join(', '), excerpt: post.excerpt, body: post.body, topic_id: post.topic_id ?? null });
+        const fresh = { title: post.title, slug: post.slug, tags: post.tags.join(', '), excerpt: post.excerpt, body: post.body, topic_id: post.topic_id ?? null };
+        setForm(fresh);
         setStatus(post.status);
+        setScheduled(post.scheduled ? new Date(post.publish_at) : null);
         setDirty(false);
         setLoaded(true);
+        const saved = readDraft(id);
+        if (saved && !sameForm(saved.form, fresh)) setRestore(saved);
+        else if (saved) dropDraft(id);
       })
       .catch((err) => alive && setError(err.message));
     return () => {
       alive = false;
     };
   }, [id, isNew]);
+
+  // Keep a copy of unsaved changes on this device (not while a found draft waits for an answer).
+  useEffect(() => {
+    if (!loaded || !dirty || restore) return undefined;
+    const timer = setTimeout(() => writeDraft(id, form), 800);
+    return () => clearTimeout(timer);
+  }, [form, dirty, loaded, restore, id]);
 
   // "Saved." / "Published." after being redirected from /admin/new.
   useEffect(() => {
@@ -101,11 +158,24 @@ export default function Editor() {
       setMessage('');
       try {
         const payload = { ...form, action };
+        if (action === 'schedule') {
+          const at = new Date(when);
+          if (!when || Number.isNaN(at.getTime())) {
+            setError('Pick a date and time first.');
+            setSaving(false);
+            return;
+          }
+          payload.publish_at = at.toISOString();
+        }
         const res = isNew
           ? await api('/api/admin/posts', { method: 'POST', body: payload })
           : await api(`/api/admin/posts/${id}`, { method: 'PUT', body: payload });
         setDirty(false);
-        const verb = action === 'publish' ? 'Published.' : 'Saved.';
+        dropDraft(isNew ? null : id);
+        if (isNew) dropDraft(res.post.id);
+        setScheduled(res.post.scheduled ? new Date(res.post.publish_at) : null);
+        setScheduling(false);
+        const verb = { publish: 'Published.', schedule: `Scheduled for ${new Date(res.post.publish_at).toLocaleString()}.` }[action] || 'Saved.';
         if (isNew) {
           navigate(`/admin/edit/${res.post.id}`, { replace: true, state: { flash: verb } });
         } else {
@@ -114,11 +184,13 @@ export default function Editor() {
           setMessage(verb);
         }
       } catch (err) {
-        setError(err.message);
+        setError(err.status === 401
+          ? 'You were signed out. Your text is kept on this device: sign in again in another tab, then save here.'
+          : err.message);
       }
       setSaving(false);
     },
-    [form, id, isNew, navigate, saving]
+    [form, id, isNew, navigate, saving, when]
   );
 
   const primary = status === 'published' ? 'save' : 'draft';
@@ -291,6 +363,33 @@ export default function Editor() {
       <div className="editor-grid">
         <form className="card panel" onSubmit={(e) => e.preventDefault()}>
           <span className="tab">{status}</span>
+          {restore && (
+            <div className="flash err restore" role="alert">
+              <p>You have unsaved changes from {new Date(restore.at).toLocaleString()} on this device.</p>
+              <p className="row">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForm(restore.form);
+                    setDirty(true);
+                    setRestore(null);
+                  }}
+                >
+                  Restore them
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => {
+                    dropDraft(id);
+                    setRestore(null);
+                  }}
+                >
+                  Discard
+                </button>
+              </p>
+            </div>
+          )}
           {error && <p className="flash err" role="alert">{error}</p>}
           {message && !error && <p className="flash ok" role="status">{message}</p>}
 
@@ -354,8 +453,17 @@ export default function Editor() {
           />
           <p id="body-hint" className="muted hint">Images go where the cursor is. You can also drag them in or paste them.</p>
 
+          {scheduled && (
+            <p className="flash ok scheduled-note">Scheduled to go out on <b>{scheduled.toLocaleString()}</b>. Until then only you can see it.</p>
+          )}
           <div className="row">
-            {status === 'published' ? (
+            {scheduled ? (
+              <>
+                <button type="button" disabled={saving} onClick={() => save('save')}>Save changes</button>
+                <button type="button" className="ghost" disabled={saving} onClick={() => save('publish')}>Publish now</button>
+                <button type="button" className="ghost" disabled={saving} onClick={() => save('draft')}>Unschedule</button>
+              </>
+            ) : status === 'published' ? (
               <>
                 <button type="button" disabled={saving} onClick={() => save('save')}>Save changes</button>
                 <button type="button" className="ghost" disabled={saving} onClick={() => save('draft')}>Unpublish</button>
@@ -366,7 +474,27 @@ export default function Editor() {
                 <button type="button" disabled={saving} onClick={() => save('publish')}>Publish</button>
               </>
             )}
+            {status !== 'published' || scheduled ? (
+              <button
+                type="button"
+                className="link"
+                aria-expanded={scheduling}
+                onClick={() => {
+                  setScheduling((v) => !v);
+                  if (!when) setWhen(localInput(scheduled || new Date(Date.now() + 24 * 3600 * 1000)));
+                }}
+              >
+                {scheduled ? 'Change time' : 'Schedule…'}
+              </button>
+            ) : null}
           </div>
+          {scheduling && (
+            <div className="inline-edit schedule-row">
+              <label htmlFor="publish-at">Publish on</label>
+              <input id="publish-at" type="datetime-local" value={when} min={localInput(new Date())} onChange={(e) => setWhen(e.target.value)} />
+              <button type="button" disabled={saving} onClick={() => save('schedule')}>Schedule</button>
+            </div>
+          )}
         </form>
 
         <section className="card panel preview">

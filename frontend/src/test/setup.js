@@ -5,4 +5,5 @@ import { cleanup } from '@testing-library/react';
 afterEach(() => {
   cleanup();
   document.documentElement.setAttribute('data-theme', 'night');
+  localStorage.clear();
 });

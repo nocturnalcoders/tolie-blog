@@ -26,9 +26,10 @@ os.environ.update(BLOG_DB_SCHEMA=SCHEMA, BLOG_UPLOAD_DIR=tmp, BLOG_OG_DIR=os.pat
                   BLOG_SHELL_URL=f'http://127.0.0.1:{httpd.server_address[1]}/index.html',
                   BLOG_SECRET_KEY='x'*64, BLOG_ADMIN_USER='chris',
                   BLOG_ADMIN_HASH=generate_password_hash('correct horse battery'), BLOG_COOKIE_SECURE='0',
-                  BLOG_SITE_URL='https://blog.example.test')
+                  BLOG_SITE_URL='https://blog.example.test', BLOG_BACKGROUND='0')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as A
+import psycopg
 c = A.app.test_client()
 def ok(name, cond):
     print(('PASS ' if cond else 'FAIL ') + name)
@@ -217,6 +218,30 @@ ok('no share picture for drafts or unknown kinds', anon.get(f'/og/{slug}/card.pn
 shell = anon.get(f'/post/{H}').get_data(as_text=True)
 ok('post shell has og:image + large twitter card', f'og:image" content="https://blog.example.test/og/{H}/card.png"' in shell and 'summary_large_image' in shell and 'og:url' in shell)
 
+# scheduled publishing
+from datetime import datetime, timedelta, timezone
+later = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+ok('schedule needs a future time', J(c, 'post', '/api/admin/posts', {'title': 'Soon', 'action': 'schedule', 'publish_at': '2020-01-01T00:00:00Z'}, tok).status_code == 400
+   and J(c, 'post', '/api/admin/posts', {'title': 'Soon', 'action': 'schedule', 'publish_at': 'tomorrow'}, tok).status_code == 400)
+r = J(c, 'post', '/api/admin/posts', {'title': 'Coming soon', 'body': 'Secret plans.', 'tags': 'soon', 'action': 'schedule', 'publish_at': later}, tok)
+ok('scheduled post saved', r.status_code == 201 and r.json['post']['status'] == 'published' and r.json['post']['scheduled'] is True)
+soon_id = r.json['post']['id']
+hidden = [anon.get('/api/posts/coming-soon').status_code == 404, 'coming-soon' not in anon.get('/api/posts').get_data(as_text=True),
+          'soon' not in [t['tag'] for t in anon.get('/api/tags').json['tags']], b'coming-soon' not in anon.get('/feed.xml').data,
+          b'coming-soon' not in anon.get('/sitemap.xml').data, anon.get('/og/coming-soon/card.png').status_code == 404,
+          anon.get('/api/posts/coming-soon/comments').status_code == 404, anon.get('/post/coming-soon').status_code == 404,
+          'coming-soon' not in str(anon.get(f'/api/posts/{H}').json)]
+ok('scheduled post hidden everywhere until its time', all(hidden))
+ok('admin can preview it and sees it as scheduled', c.get('/api/posts/coming-soon').status_code == 200 and [p for p in c.get('/api/admin/posts').json['posts'] if p['id'] == soon_id][0]['scheduled'] is True)
+with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+    conn.execute(f'UPDATE "{SCHEMA}".posts SET published_at = now() - interval \'1 second\' WHERE id = %s', (soon_id,))
+ok('appears once its time has come', anon.get('/api/posts/coming-soon').status_code == 200 and b'coming-soon' in anon.get('/feed.xml').data)
+r = J(c, 'post', '/api/admin/posts', {'title': 'Later still', 'action': 'schedule', 'publish_at': later}, tok)
+r2 = J(c, 'put', f"/api/admin/posts/{r.json['post']['id']}", {'title': 'Later still', 'action': 'publish'}, tok)
+ok('"publish now" on a scheduled post publishes it now', r2.json['post']['scheduled'] is False and anon.get('/api/posts/later-still').status_code == 200)
+for i in (soon_id, r.json['post']['id']):
+    J(c, 'delete', f'/api/admin/posts/{i}', None, tok)
+
 # topics
 tp = anon.get('/api/topics').json['topics']
 ok('starter topics in order', [x['name'] for x in tp] == ['Software', 'Security', 'Hardware', 'Football', 'Anime & Books', 'Life'] and tp[4]['slug'] == 'anime-books' and all(x['count'] == 0 for x in tp))
@@ -243,6 +268,150 @@ for x in c.get('/api/admin/topics').json['topics']:
 A.init_db()
 ok('starter topics are not brought back after you delete them', anon.get('/api/topics').json['topics'] == [])
 J(c, 'delete', f'/api/admin/posts/{sec_id}', None, tok)
+
+# bulk topics, archive, about
+ids = {x['slug']: x['id'] for x in J(c, 'post', '/api/admin/topics', {'name': 'Bulk'}, tok).json['topics']}
+pids = [p['id'] for p in c.get('/api/admin/posts').json['posts']]
+ok('bulk topic needs admin + valid input', J(v, 'post', '/api/admin/posts/topic', {'ids': pids, 'topic_id': ids['bulk']}, vt).status_code == 401
+   and J(c, 'post', '/api/admin/posts/topic', {'ids': [], 'topic_id': ids['bulk']}, tok).status_code == 400
+   and J(c, 'post', '/api/admin/posts/topic', {'ids': pids, 'topic_id': 999999}, tok).status_code == 400)
+r = J(c, 'post', '/api/admin/posts/topic', {'ids': pids, 'topic_id': ids['bulk']}, tok)
+ok('bulk topic sets every post', r.json['updated'] == len(pids) and all(p['topic_id'] == ids['bulk'] for p in c.get('/api/admin/posts').json['posts']))
+ok('bulk topic can clear', J(c, 'post', '/api/admin/posts/topic', {'ids': pids, 'topic_id': None}, tok).json['updated'] == len(pids)
+   and all(p['topic_id'] is None for p in c.get('/api/admin/posts').json['posts']))
+J(c, 'delete', f"/api/admin/topics/{ids['bulk']}", None, tok)
+arc = anon.get('/api/archive').json['posts']
+ok('archive lists published posts only, newest first', [p['slug'] for p in arc] == ['my-first-draft-2', H] and set(arc[0]) == {'slug', 'title', 'date', 'topic'})
+ok('about has a default', 'Christianto Lie' in anon.get('/api/about').json['html'])
+ok('about edit needs admin', J(v, 'put', '/api/admin/about', {'body': 'x'}, vt).status_code == 401)
+r = J(c, 'put', '/api/admin/about', {'body': '# Me\n\n<script>x</script>I build things.'}, tok)
+ok('about saved, sanitised', r.status_code == 200 and '<script' not in anon.get('/api/about').json['html'] and 'I build things.' in anon.get('/api/about').json['html']
+   and c.get('/api/admin/about').json['body'].startswith('# Me'))
+
+# email updates + comment replies (mail is captured, nothing is sent)
+outbox = []
+def capture(to, subject, text, headers=None):
+    outbox.append({'to': to, 'subject': subject, 'text': text, 'headers': headers or {}}); return True
+def reset_rate():
+    with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+        conn.execute(f'UPDATE "{SCHEMA}".comments SET created_at = created_at - interval \'1 hour\'')
+        conn.execute(f'UPDATE "{SCHEMA}".subscribers SET created_at = created_at - interval \'2 hours\', last_sent_at = last_sent_at - interval \'1 hour\'')
+import re as _re
+def token_in(text, kind='token'): return _re.search(kind + r'=([A-Za-z0-9_-]+)', text).group(1)
+w3 = A.app.test_client(); w3t = csrf(w3)
+ok('subscribe off without mail settings', J(w3, 'post', '/api/subscribe', {'email': 'a@example.test'}, w3t).status_code == 503 and w3.get('/api/session').json['mail'] is False)
+real_send = A.send_email
+A.send_email, A.SMTP_HOST, A.MAIL_FROM = capture, 'smtp.example.test', 'blog@example.test'
+tid = {x['slug']: x['id'] for x in J(c, 'post', '/api/admin/topics', {'name': 'Software'}, tok).json['topics']}
+tid = {x['slug']: x['id'] for x in J(c, 'post', '/api/admin/topics', {'name': 'Football'}, tok).json['topics']}
+ok('session says mail is on', w3.get('/api/session').json['mail'] is True)
+ok('subscribe checks the address', J(w3, 'post', '/api/subscribe', {'email': 'nope'}, w3t).status_code == 400)
+ok('subscribe honeypot', J(w3, 'post', '/api/subscribe', {'email': 'bot@example.test', 'website': 'x'}, w3t).json['ok'] and not outbox)
+ok('subscribe needs csrf', w3.post('/api/subscribe', json={'email': 'a@example.test'}).status_code == 400)
+J(w3, 'post', '/api/subscribe', {'email': ' Reader@Example.TEST ', 'topics': ['software', 'bogus']}, w3t)
+ok('confirmation email sent', len(outbox) == 1 and outbox[0]['to'] == 'reader@example.test' and '/subscribe/confirm?token=' in outbox[0]['text'] and 'Software' in outbox[0]['text'])
+tok_reader = token_in(outbox[0]['text'])
+J(w3, 'post', '/api/subscribe', {'email': 'reader@example.test'}, w3t)
+ok('asking again right away sends nothing new', len(outbox) == 1)
+def publish(title, topic=None, **extra):
+    r = J(c, 'post', '/api/admin/posts', {'title': title, 'body': 'Body.', 'excerpt': f'About {title}.', 'topic_id': topic, 'action': 'publish', **extra}, tok)
+    return r.json['post']
+outbox.clear(); p1 = publish('Before confirming', tid['software'])
+ok('nothing goes to unconfirmed addresses', outbox == [])
+ok('bad confirm link', w3.post('/api/subscribe/confirm', json={'token': 'nope'}).status_code == 404)
+r = w3.post('/api/subscribe/confirm', json={'token': tok_reader}); ok('confirm', r.status_code == 200 and r.json['topics'] == ['software'])
+J(w3, 'post', '/api/subscribe', {'email': 'all@example.test'}, w3t); tok_all = token_in(outbox[-1]['text']); w3.post('/api/subscribe/confirm', json={'token': tok_all})
+outbox.clear(); p2 = publish('Rust in anger', tid['software'])
+ok('new post mailed to matching subscribers', sorted(m['to'] for m in outbox) == ['all@example.test', 'reader@example.test'] and all(m['subject'] == 'Rust in anger' for m in outbox)
+   and '/post/rust-in-anger' in outbox[0]['text'] and 'About Rust in anger.' in outbox[0]['text'])
+m = [x for x in outbox if x['to'] == 'reader@example.test'][0]
+ok('one-click unsubscribe headers + link', m['headers']['List-Unsubscribe-Post'] == 'List-Unsubscribe=One-Click' and f'/api/unsubscribe?token={tok_reader}' in m['headers']['List-Unsubscribe'] and f'/unsubscribe?token={tok_reader}' in m['text'])
+outbox.clear(); p3 = publish('Sunday futsal', tid['football'])
+ok('topic choice respected', [x['to'] for x in outbox] == ['all@example.test'])
+outbox.clear(); ok('each post is mailed once', A.announce_due() == 0 and outbox == [])
+ok('old posts were never mailed', not any('Hello from the little town' in x['subject'] for x in outbox))
+later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+outbox.clear(); p4 = J(c, 'post', '/api/admin/posts', {'title': 'Scheduled one', 'action': 'schedule', 'publish_at': later}, tok).json['post']
+ok('scheduled post not mailed early', outbox == [] and A.announce_due() == 0)
+with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+    conn.execute(f'UPDATE "{SCHEMA}".posts SET published_at = now() - interval \'1 second\' WHERE id = %s', (p4['id'],))
+ok('scheduled post mailed when its time comes', A.announce_due() == 1 and outbox[0]['to'] == 'all@example.test')
+ok('admin sees subscriber count', c.get('/api/admin/stats').json['subscribers'] == 2)
+ok('one-click unsubscribe (no csrf)', A.app.test_client().post(f'/api/unsubscribe?token={tok_all}', data='List-Unsubscribe=One-Click').status_code == 200
+   and c.get('/api/admin/stats').json['subscribers'] == 1)
+
+# replies
+reset_rate(); outbox.clear()
+r1 = A.app.test_client(); r1t = csrf(r1)
+ok('comment email is checked', J(r1, 'post', f'/api/posts/{H}/comments', {'name': 'Budi', 'body': 'Hi all', 'email': 'nope'}, r1t).status_code == 400)
+J(r1, 'post', f'/api/posts/{H}/comments', {'name': 'Budi', 'body': 'Great post, thanks', 'email': 'Budi@Example.test', 'notify': True}, r1t)
+top = [x for x in c.get('/api/admin/comments').json['comments'] if x['author'] == 'Budi'][0]
+ok('cannot reply to a comment that is still waiting', J(r1, 'post', f'/api/posts/{H}/comments', {'name': 'Eko', 'body': 'Me too', 'parent_id': top['id']}, r1t).status_code == 400)
+J(c, 'put', f"/api/admin/comments/{top['id']}", None, tok)
+r2 = A.app.test_client(); r2t = csrf(r2)
+J(r2, 'post', f'/api/posts/{H}/comments', {'name': 'Eko', 'body': 'Agreed!', 'parent_id': top['id']}, r2t)
+reply = [x for x in c.get('/api/admin/comments').json['comments'] if x['author'] == 'Eko'][0]
+ok('moderation shows who it replies to', reply['reply_to'] == 'Budi')
+outbox.clear(); J(c, 'put', f"/api/admin/comments/{reply['id']}", None, tok)
+ok('reply email after approval', len(outbox) == 1 and outbox[0]['to'] == 'budi@example.test' and 'Eko replied' in outbox[0]['subject'] and 'Agreed!' in outbox[0]['text'] and '/unsubscribe?replies=' in outbox[0]['text'])
+stop_token = token_in(outbox[0]['text'], 'replies')
+outbox.clear(); J(c, 'put', f"/api/admin/comments/{reply['id']}", None, tok)
+ok('approving twice mails once', outbox == [])
+reset_rate()
+J(r2, 'post', f'/api/posts/{H}/comments', {'name': 'Eko', 'body': 'Reply to a reply', 'parent_id': reply['id']}, r2t)
+nested = [x for x in c.get('/api/admin/comments').json['comments'] if x['body'] == 'Reply to a reply'][0]
+J(c, 'put', f"/api/admin/comments/{nested['id']}", None, tok)
+pub = {x['id']: x for x in anon.get(f'/api/posts/{H}/comments').json['comments']}
+ok('replies stay one level deep', pub[nested['id']]['parent_id'] == top['id'] and pub[reply['id']]['parent_id'] == top['id'])
+ok('emails never shown publicly', 'email' not in pub[top['id']] and 'notify_token' not in pub[top['id']] and 'budi@' not in anon.get(f'/api/posts/{H}/comments').get_data(as_text=True))
+outbox.clear(); J(c, 'post', f'/api/posts/{H}/comments', {'body': 'Thanks Budi!', 'parent_id': top['id']}, tok)
+ok('author reply mails right away', len(outbox) == 1 and 'Christianto Lie replied' in outbox[0]['subject'])
+ok('stop reply emails', A.app.test_client().post(f'/api/comments/stop?token={stop_token}').status_code == 200)
+outbox.clear(); J(c, 'post', f'/api/posts/{H}/comments', {'body': 'One more', 'parent_id': top['id']}, tok)
+ok('no more reply emails after stopping', outbox == [])
+J(c, 'delete', f"/api/admin/comments/{top['id']}", None, tok)
+ok('deleting a comment removes its replies', not any(x['parent_id'] == top['id'] for x in anon.get(f'/api/posts/{H}/comments').json['comments']))
+for p_ in (p1, p2, p3, p4):
+    J(c, 'delete', f"/api/admin/posts/{p_['id']}", None, tok)
+A.send_email, A.SMTP_HOST, A.MAIL_FROM = real_send, '', ''
+
+# two-factor login
+import time as _time
+def now_code(secret, shift=0): return A.totp_at(secret, int(_time.time() // 30) + shift)
+ok('2fa off at first', c.get('/api/admin/2fa').json == {'enabled': False, 'recovery_left': 0})
+ok('2fa needs admin', anon.get('/api/admin/2fa').status_code == 401)
+ok('enable without setup refused', J(c, 'post', '/api/admin/2fa/enable', {'code': '123456'}, tok).status_code == 400)
+st = J(c, 'post', '/api/admin/2fa/setup', None, tok).json
+ok('setup gives a secret, an otpauth link and a QR picture', len(st['secret']) == 32 and st['uri'].startswith('otpauth://totp/') and f"secret={st['secret']}" in st['uri'] and st['qr'].startswith('data:image/svg+xml'))
+ok('wrong code does not enable', J(c, 'post', '/api/admin/2fa/enable', {'code': '000000' if now_code(st['secret']) != '000000' else '111111'}, tok).status_code == 400)
+r = J(c, 'post', '/api/admin/2fa/enable', {'code': now_code(st['secret'])}, tok)
+ok('enable returns 8 recovery codes', r.status_code == 200 and len(r.json['recovery_codes']) == 8 and c.get('/api/admin/2fa').json == {'enabled': True, 'recovery_left': 8})
+codes = r.json['recovery_codes']
+ok('setup refused while on', J(c, 'post', '/api/admin/2fa/setup', None, tok).status_code == 400)
+d = A.app.test_client(); dt = csrf(d)
+def login(cl, t, code=None):
+    body = {'username': 'chris', 'password': 'correct horse battery'}
+    if code is not None: body['code'] = code
+    return J(cl, 'post', '/api/login', body, t)
+r = login(d, dt); ok('password alone now asks for the code', r.status_code == 401 and r.json['need_code'] is True and d.get('/api/session').json['admin'] is False)
+ok('wrong password never reaches the code step', 'need_code' not in J(d, 'post', '/api/login', {'username': 'chris', 'password': 'nope'}, dt).json)
+ok('wrong code refused', login(d, dt, '000000' if now_code(st['secret'], 1) != '000000' else '111111').status_code == 401)
+with psycopg.connect(os.environ['DATABASE_URL']) as conn: conn.execute(f'DELETE FROM "{SCHEMA}".login_attempts')
+r = login(d, dt, now_code(st['secret'], 1)); ok('right code signs in', r.status_code == 200 and d.get('/api/session').json['admin'] is True)
+e = A.app.test_client(); et = csrf(e)
+ok('a code works only once', login(e, et, now_code(st['secret'], 1)).status_code == 401)
+r = login(e, et, codes[0].upper()); ok('recovery code signs in (any case)', r.status_code == 200)
+f = A.app.test_client(); ft = csrf(f)
+with psycopg.connect(os.environ['DATABASE_URL']) as conn: conn.execute(f'DELETE FROM "{SCHEMA}".login_attempts')
+ok('recovery code works only once', login(f, ft, codes[0]).status_code == 401 and c.get('/api/admin/2fa').json['recovery_left'] == 7)
+ok('disable needs a valid code', J(c, 'post', '/api/admin/2fa/disable', {'code': 'nope'}, tok).status_code == 400)
+ok('disable with a recovery code', J(c, 'post', '/api/admin/2fa/disable', {'code': codes[1]}, tok).json['enabled'] is False and c.get('/api/admin/2fa').json['enabled'] is False)
+with psycopg.connect(os.environ['DATABASE_URL']) as conn: conn.execute(f'DELETE FROM "{SCHEMA}".login_attempts')
+g2 = A.app.test_client(); ok('password alone works again', login(g2, csrf(g2)).status_code == 200)
+st = J(c, 'post', '/api/admin/2fa/setup', None, tok).json; J(c, 'post', '/api/admin/2fa/enable', {'code': now_code(st['secret'])}, tok)
+import subprocess
+out = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / 'manage.py'), 'disable-2fa'], capture_output=True, text=True, env={**os.environ})
+ok('manage.py disable-2fa (lost phone)', 'is off' in out.stdout and c.get('/api/admin/2fa').json['enabled'] is False)
 
 # delete / logout / lockout
 ok('delete', J(c, 'delete', f'/api/admin/posts/{pid2}', None, tok).status_code == 200 and c.get(f'/api/posts/my-first-draft-2').status_code == 404)

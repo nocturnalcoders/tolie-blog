@@ -4,7 +4,7 @@ import { api, setCsrf } from './api.js';
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [state, setState] = useState({ ready: false, admin: false, configured: true });
+  const [state, setState] = useState({ ready: false, admin: false, configured: true, mail: false });
 
   useEffect(() => {
     let alive = true;
@@ -12,16 +12,18 @@ export function AuthProvider({ children }) {
       .then((s) => {
         if (!alive) return;
         setCsrf(s.csrf);
-        setState({ ready: true, admin: !!s.admin, configured: s.configured !== false });
+        setState({ ready: true, admin: !!s.admin, configured: s.configured !== false, mail: !!s.mail });
       })
-      .catch(() => alive && setState({ ready: true, admin: false, configured: true }));
+      .catch(() => alive && setState({ ready: true, admin: false, configured: true, mail: false }));
     return () => {
       alive = false;
     };
   }, []);
 
-  const login = useCallback(async (username, password) => {
-    const r = await api('/api/login', { method: 'POST', body: { username, password } });
+  const login = useCallback(async (username, password, code) => {
+    const body = { username, password };
+    if (code) body.code = code;
+    const r = await api('/api/login', { method: 'POST', body });
     setCsrf(r.csrf);
     setState((s) => ({ ...s, admin: true }));
   }, []);
