@@ -96,6 +96,20 @@ docker run --rm -v tolie-blog_uploads:/data -v "$PWD/backups:/in:ro" alpine \
 - Two-factor login is set up at `/admin/security`. Lost your phone and the recovery codes? On the droplet:
   `docker compose exec api python manage.py disable-2fa`, then sign in with your password.
 - Topics (the few big sections on the home page, one per note) are managed at `/admin/topics`.
+- Series, language and translation are picked in the editor. A series has its own page at `/series/<name>`.
+- The editor keeps the last 50 versions of each note ("Earlier versions"), and can make a secret preview
+  link for a draft (`/preview/...`, not listed by search engines).
+
+## Alerts when something breaks
+
+Both use the same Telegram bot as the comment notifications (`BLOG_TELEGRAM_TOKEN` / `BLOG_TELEGRAM_CHAT_ID`):
+
+- **Errors in the API:** with the bot set in `.env`, every crash sends a message (at most one per 10 minutes).
+- **Blog down:** `.github/workflows/uptime.yml` checks `/healthz` from GitHub every 10 minutes, so it still
+  works when the droplet itself is off. In the GitHub repo, open Settings > Secrets and variables > Actions
+  and add the secrets `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID` (same values as in `.env`). Run it once by hand
+  from the Actions tab to check. GitHub pauses scheduled workflows after 60 days without commits; the Actions
+  tab has a button to turn it back on.
   The first deploy creates Software, Security, Hardware, Football, Anime & Books and Life once.
 - To get a message for every new comment, add the Telegram and/or email settings from
   `.env.example` to `.env` on the droplet, then run `bash deploy/deploy.sh`.

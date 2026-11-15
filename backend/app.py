@@ -6,6 +6,9 @@ The React frontend (../frontend) talks to this API. Public routes:
   GET  /api/topics                   the topics (Software, Security, ...) with post counts
   GET  /api/archive                  every published post, newest first (title, date, topic)
   GET  /api/about                    the About page
+  GET  /api/series/<slug>            the parts of a series, in order
+  GET  /api/popular                  the most read posts of the last 7 days
+  GET  /api/preview/<token>          a draft, through its secret preview link
   GET  /api/tags?limit=               tags with counts (most used first), and how many there are
   GET  /api/posts/<slug>             one post (rendered HTML)
   GET/POST /api/posts/<slug>/comments    approved comments / leave one (held for review)
@@ -29,6 +32,9 @@ Admin routes need a signed-in session and a CSRF header:
   GET/POST /api/admin/topics   PUT/DELETE /api/admin/topics/<id>   POST /api/admin/topics/order
   POST /api/admin/posts/topic        set the topic of several posts at once
   GET/PUT /api/admin/about           edit the About page
+  GET/POST /api/admin/series   DELETE /api/admin/series/<id>
+  GET  /api/admin/posts/<id>/revisions   GET /api/admin/revisions/<id>   earlier versions, with a diff
+  POST/DELETE /api/admin/posts/<id>/preview-link   secret link to a draft
   GET  /api/admin/2fa   POST /api/admin/2fa/setup|enable|disable   two-factor login
 
 Configuration comes from environment variables (docker-compose.yml sets them).
@@ -37,6 +43,7 @@ New comments can be announced on Telegram and/or by email (see .env.example).
 from __future__ import annotations
 
 import base64
+import difflib
 import io
 import json
 import hashlib
@@ -129,6 +136,8 @@ MAIL_FROM = os.environ.get("BLOG_MAIL_FROM", "") or (SMTP_USER if "@" in SMTP_US
 BACKGROUND = os.environ.get("BLOG_BACKGROUND", "1") != "0"  # the tests switch threads off
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 PER_PAGE = 8
+LANGS = {"en": "English", "id": "Bahasa Indonesia"}
+KEEP_REVISIONS = 50
 MAX_UPLOAD = 15 * 1024 * 1024  # phone photos are big; they are shrunk on upload
 MAX_IMAGE_WIDTH = 1600
 MAX_IMAGE_PIXELS = 50_000_000
@@ -221,6 +230,36 @@ ALTER TABLE posts ADD COLUMN IF NOT EXISTS announced_at TIMESTAMPTZ;
 ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id BIGINT REFERENCES comments (id) ON DELETE CASCADE;
 ALTER TABLE comments ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '';
 ALTER TABLE comments ADD COLUMN IF NOT EXISTS notify_token TEXT;
+CREATE TABLE IF NOT EXISTS series (
+  id         BIGSERIAL PRIMARY KEY,
+  slug       TEXT NOT NULL UNIQUE,
+  name       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS series_id BIGINT REFERENCES series (id) ON DELETE SET NULL;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS series_part INTEGER;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS lang TEXT NOT NULL DEFAULT 'en';
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS translation_of BIGINT REFERENCES posts (id) ON DELETE SET NULL;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS preview_token TEXT UNIQUE;
+-- Full-text search. array_to_string is only "stable", so it is wrapped to be usable in a generated column.
+CREATE OR REPLACE FUNCTION blog_search_doc(title TEXT, tags TEXT[], body TEXT) RETURNS tsvector
+  LANGUAGE sql IMMUTABLE AS $$
+    SELECT setweight(to_tsvector('simple', coalesce(title, '')), 'A')
+        || setweight(to_tsvector('simple', array_to_string(tags, ' ')), 'B')
+        || setweight(to_tsvector('simple', coalesce(body, '')), 'C') $$;
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS search tsvector
+  GENERATED ALWAYS AS (blog_search_doc(title, tags, body_md)) STORED;
+CREATE INDEX IF NOT EXISTS idx_posts_search ON posts USING GIN (search);
+CREATE TABLE IF NOT EXISTS post_revisions (
+  id         BIGSERIAL PRIMARY KEY,
+  post_id    BIGINT NOT NULL REFERENCES posts (id) ON DELETE CASCADE,
+  title      TEXT NOT NULL,
+  excerpt    TEXT NOT NULL,
+  body_md    TEXT NOT NULL,
+  tags       TEXT[] NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_revisions_post ON post_revisions (post_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS subscribers (
   id           BIGSERIAL PRIMARY KEY,
   email        TEXT NOT NULL UNIQUE,
@@ -434,14 +473,36 @@ def summary(row: dict, admin: bool = False) -> dict:
         "date": iso(row["published_at"] or row["created_at"]),
         "read_min": max(1, round(words / 200)),
         "topic": topics_by_id().get(row.get("topic_id")),
+        "lang": row["lang"],
     }
+    if row.get("hl") is not None:
+        data["snippet"] = snippet_parts(row["hl"])
     if admin:
         data["status"] = row["status"]
         data["updated_at"] = iso(row["updated_at"])
         data["topic_id"] = row.get("topic_id")
         data["scheduled"] = row["status"] == "published" and not is_live(row)
         data["publish_at"] = iso(row["published_at"])
+        data["series_id"] = row["series_id"]
+        data["series_part"] = row["series_part"]
+        data["translation_of"] = row["translation_of"]
+        data["preview_url"] = f"{SITE_URL}/preview/{row['preview_token']}" if row["preview_token"] else None
     return data
+
+
+HIT_START, HIT_END = "\ue000", "\ue001"  # private-use characters mark matches in search snippets
+
+
+def snippet_parts(headline: str) -> list[dict]:
+    """A search snippet as [{text, hit}], so the page can bold matches without trusting any HTML."""
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", headline)  # links and images: keep the words
+    text = re.sub(r"[`*_#>|~]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    parts = []
+    for i, chunk in enumerate(re.split(f"[{HIT_START}{HIT_END}]", text)):
+        if chunk:
+            parts.append({"text": chunk, "hit": i % 2 == 1})
+    return parts
 
 
 def is_live(row: dict) -> bool:
@@ -672,11 +733,18 @@ def api_logout():
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
-def list_posts(where: str, args: list, page: int, admin: bool = False):
+def list_posts(where: str, args: list, page: int, admin: bool = False, q: str = ""):
     total = db().execute(f"SELECT COUNT(*) AS n FROM posts WHERE {where}", args).fetchone()["n"]
-    rows = db().execute(
-        f"SELECT * FROM posts WHERE {where} ORDER BY published_at DESC NULLS LAST, id DESC LIMIT %s OFFSET %s",
-        [*args, PER_PAGE, (page - 1) * PER_PAGE]).fetchall()
+    if q:  # best match first (a title hit counts most), with a highlighted snippet
+        select = ("*, ts_headline('simple', body_md, websearch_to_tsquery('simple', %s), %s) AS hl")
+        order = ("ts_rank(search, websearch_to_tsquery('simple', %s))"
+                 " + CASE WHEN title ILIKE %s ESCAPE '\\' THEN 1 ELSE 0 END DESC, published_at DESC, id DESC")
+        options = f"StartSel={HIT_START},StopSel={HIT_END},MaxWords=26,MinWords=12,ShortWord=2,MaxFragments=2"
+        params = [q, options, *args, q, f"%{like_escape(q)}%"]
+    else:
+        select, order, params = "*", "published_at DESC NULLS LAST, id DESC", list(args)
+    rows = db().execute(f"SELECT {select} FROM posts WHERE {where} ORDER BY {order} LIMIT %s OFFSET %s",
+                        [*params, PER_PAGE, (page - 1) * PER_PAGE]).fetchall()
     return [summary(r, admin) for r in rows], total, max(1, -(-total // PER_PAGE))
 
 
@@ -689,16 +757,17 @@ def api_posts():
     where, args = "status = 'published' AND published_at <= now()", []
     if q:
         like = f"%{like_escape(q)}%"
-        where += (" AND (title ILIKE %s ESCAPE '\\' OR body_md ILIKE %s ESCAPE '\\'"
-                  " OR array_to_string(tags, ' ') ILIKE %s ESCAPE '\\')")
-        args += [like, like, like]
+        # Whole words through the index; the ILIKE part still finds pieces of words ("kube" -> kubernetes).
+        where += (" AND (search @@ websearch_to_tsquery('simple', %s) OR title ILIKE %s ESCAPE '\\'"
+                  " OR body_md ILIKE %s ESCAPE '\\' OR array_to_string(tags, ' ') ILIKE %s ESCAPE '\\')")
+        args += [q, like, like, like]
     if tag:
         where += " AND tags @> %s::text[]"
         args.append([tag])
     if topic:
         where += " AND topic_id = (SELECT id FROM topics WHERE slug = %s)"
         args.append(topic)
-    posts, total, pages = list_posts(where, args, page)
+    posts, total, pages = list_posts(where, args, page, q=q)
     resp = jsonify(posts=posts, total=total, page=page, pages=pages, q=q, tag=tag, topic=topic)
     resp.headers["Cache-Control"] = "no-cache"
     return resp
@@ -723,6 +792,43 @@ def api_archive():
     resp = jsonify(posts=[{"slug": r["slug"], "title": r["title"], "date": iso(r["published_at"]),
                            "topic": topics_by_id().get(r["topic_id"])} for r in rows])
     resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/series/<slug>")
+def api_series(slug: str):
+    s = db().execute("SELECT * FROM series WHERE slug = %s", (slug,)).fetchone()
+    if s is None:
+        return jsonify(error="That series doesn't exist."), 404
+    rows = db().execute("SELECT * FROM posts WHERE series_id = %s AND status = 'published' AND published_at <= now()"
+                        " ORDER BY series_part NULLS LAST, published_at, id", (s["id"],)).fetchall()
+    resp = jsonify(series={"slug": s["slug"], "name": s["name"]}, posts=[summary(r) for r in rows])
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/popular")
+def api_popular():
+    rows = db().execute(
+        "SELECT p.*, COUNT(v.id) AS views FROM page_views v JOIN posts p ON p.id = v.post_id"
+        " WHERE v.created_at >= now() - interval '7 days' AND p.status = 'published' AND p.published_at <= now()"
+        " GROUP BY p.id ORDER BY views DESC, p.published_at DESC LIMIT 5").fetchall()
+    resp = jsonify(posts=[{**summary(r), "views": r["views"]} for r in rows])
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/preview/<token>")
+def api_preview(token: str):
+    row = db().execute("SELECT * FROM posts WHERE preview_token = %s", (token,)).fetchone() if len(token) > 20 else None
+    if row is None:
+        return jsonify(error="This preview link was switched off, or it never existed."), 404
+    post = summary(row)
+    post["html"], post["toc"] = render_post(row["body_md"])
+    post["live"] = is_live(row)
+    resp = jsonify(post=post)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Robots-Tag"] = "noindex"
     return resp
 
 
@@ -773,6 +879,8 @@ def api_post(slug: str):
             "SELECT *, cardinality(ARRAY(SELECT unnest(tags) INTERSECT SELECT unnest(%s::text[]))) AS shared"
             " FROM posts WHERE status = 'published' AND published_at <= now() AND id <> %s"
             " ORDER BY shared DESC, published_at DESC, id DESC LIMIT 3", (list(row["tags"]), row["id"])).fetchall()]
+    post["series"] = series_box(row)
+    post["translation"] = translation_of(row)
     resp = jsonify(post=post, prev=prev_row, next=nxt_row, related=related)
     resp.headers["Cache-Control"] = "no-cache"
     return resp
@@ -781,6 +889,26 @@ def api_post(slug: str):
 # --------------------------------------------------------------------------
 # Comments and reactions
 # --------------------------------------------------------------------------
+def series_box(row: dict) -> dict | None:
+    """The series this post belongs to, with its published parts in order."""
+    if not row["series_id"]:
+        return None
+    s = db().execute("SELECT slug, name FROM series WHERE id = %s", (row["series_id"],)).fetchone()
+    parts = db().execute(
+        "SELECT id, slug, title FROM posts WHERE series_id = %s AND (status = 'published' AND published_at <= now()"
+        " OR id = %s) ORDER BY series_part NULLS LAST, published_at, id", (row["series_id"], row["id"])).fetchall()
+    return {"slug": s["slug"], "name": s["name"],
+            "parts": [{"slug": r["slug"], "title": r["title"], "current": r["id"] == row["id"]} for r in parts]}
+
+
+def translation_of(row: dict) -> dict | None:
+    if not row["translation_of"]:
+        return None
+    t = db().execute("SELECT slug, title, lang FROM posts WHERE id = %s AND status = 'published'"
+                     " AND published_at <= now()", (row["translation_of"],)).fetchone()
+    return {"slug": t["slug"], "title": t["title"], "lang": t["lang"], "language": LANGS[t["lang"]]} if t else None
+
+
 def published_post_id(slug: str) -> int | None:
     row = db().execute("SELECT id FROM posts WHERE slug = %s AND status = 'published' AND published_at <= now()", (slug,)).fetchone()
     return row["id"] if row else None
@@ -1212,6 +1340,10 @@ def read_payload() -> dict:
         "action": str(data.get("action", "draft")),
         "topic_id": data.get("topic_id") if isinstance(data.get("topic_id"), int) else None,
         "publish_at": parse_when(data.get("publish_at")),
+        "series_id": data.get("series_id") if isinstance(data.get("series_id"), int) else None,
+        "series_part": data.get("series_part") if isinstance(data.get("series_part"), int) and 0 < data.get("series_part") < 1000 else None,
+        "lang": data.get("lang") if data.get("lang") in LANGS else "en",
+        "translation_of": data.get("translation_of") if isinstance(data.get("translation_of"), int) else None,
     }
 
 
@@ -1237,6 +1369,19 @@ def admin_save(pid: int | None = None):
         return jsonify(error="Give the post a title first."), 400
     if form["topic_id"] is not None and form["topic_id"] not in topics_by_id():
         return jsonify(error="That topic doesn't exist any more. Pick another one."), 400
+    if form["series_id"] is not None and not db().execute("SELECT 1 FROM series WHERE id = %s",
+                                                          (form["series_id"],)).fetchone():
+        return jsonify(error="That series doesn't exist any more. Pick another one."), 400
+    partner = form["translation_of"]
+    if partner is not None and (partner == pid or not db().execute("SELECT 1 FROM posts WHERE id = %s",
+                                                                    (partner,)).fetchone()):
+        return jsonify(error="Pick another note as the translation."), 400
+    part = form["series_part"]
+    if form["series_id"] is not None and part is None:  # next free part number
+        part = db().execute("SELECT COALESCE(MAX(series_part), 0) + 1 AS n FROM posts WHERE series_id = %s AND id <> %s",
+                            (form["series_id"], pid or 0)).fetchone()["n"]
+    if form["series_id"] is None:
+        part = None
     slug = unique_slug(slugify(form["slug"] or form["title"]), ignore_id=pid)
     excerpt = form["excerpt"] or auto_excerpt(form["body_md"])
     action = form["action"]
@@ -1252,18 +1397,32 @@ def admin_save(pid: int | None = None):
         status, when = "draft", was
     else:  # "save": keep status and date
         status, when = existing["status"], was
+    fields = (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status, when,
+              form["series_id"], part, form["lang"], partner)
     if existing:
+        changed = (existing["title"], existing["body_md"], existing["excerpt"], list(existing["tags"])) != \
+                  (form["title"], form["body_md"], excerpt, form["tags"])
+        if changed:  # keep the version being replaced
+            db().execute("INSERT INTO post_revisions (post_id, title, excerpt, body_md, tags) VALUES (%s, %s, %s, %s, %s)",
+                         (pid, existing["title"], existing["excerpt"], existing["body_md"], existing["tags"]))
+            db().execute("DELETE FROM post_revisions WHERE post_id = %s AND id NOT IN (SELECT id FROM post_revisions"
+                         " WHERE post_id = %s ORDER BY id DESC LIMIT %s)", (pid, pid, KEEP_REVISIONS))
         row = db().execute(
             """UPDATE posts SET slug=%s, title=%s, excerpt=%s, body_md=%s, tags=%s, topic_id=%s, status=%s,
-                 updated_at=now(), published_at=%s WHERE id=%s RETURNING *""",
-            (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status, when,
-             pid)).fetchone()
+                 published_at=%s, series_id=%s, series_part=%s, lang=%s, translation_of=%s, updated_at=now()
+               WHERE id=%s RETURNING *""", (*fields, pid)).fetchone()
     else:
         row = db().execute(
-            """INSERT INTO posts (slug, title, excerpt, body_md, tags, topic_id, status, published_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""",
-            (slug, form["title"], excerpt, form["body_md"], form["tags"], form["topic_id"], status,
-             when)).fetchone()
+            """INSERT INTO posts (slug, title, excerpt, body_md, tags, topic_id, status, published_at,
+                 series_id, series_part, lang, translation_of)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *""", fields).fetchone()
+    # Translations point at each other; whatever they were paired with before lets go.
+    me = row["id"]
+    db().execute("UPDATE posts SET translation_of = NULL WHERE translation_of = %s AND id IS DISTINCT FROM %s",
+                 (me, partner))
+    if partner is not None:
+        db().execute("UPDATE posts SET translation_of = NULL WHERE translation_of = %s AND id <> %s", (partner, me))
+        db().execute("UPDATE posts SET translation_of = %s WHERE id = %s", (me, partner))
     db().commit()
     if is_live(row) and row["announced_at"] is None:
         background(announce_due)
@@ -1349,6 +1508,84 @@ def admin_posts_topic():
     n = db().execute("UPDATE posts SET topic_id = %s WHERE id = ANY(%s)", (topic_id, ids)).rowcount
     db().commit()
     return jsonify(updated=n)
+
+
+def series_rows() -> list[dict]:
+    return [{"id": r["id"], "slug": r["slug"], "name": r["name"], "count": r["count"]} for r in db().execute(
+        "SELECT s.*, COUNT(p.id) AS count FROM series s LEFT JOIN posts p ON p.series_id = s.id"
+        " GROUP BY s.id ORDER BY s.name, s.id").fetchall()]
+
+
+@app.get("/api/admin/series")
+@admin_required
+def admin_series():
+    return jsonify(series=series_rows())
+
+
+@app.post("/api/admin/series")
+@admin_required
+def admin_series_create():
+    name = re.sub(r"\s+", " ", str((request.get_json(silent=True) or {}).get("name", ""))).strip()[:80]
+    if not name:
+        return jsonify(error="Give the series a name."), 400
+    base, n = slugify(name), 2
+    slug = base
+    while db().execute("SELECT 1 FROM series WHERE slug = %s", (slug,)).fetchone():
+        slug, n = f"{base}-{n}", n + 1
+    sid = db().execute("INSERT INTO series (slug, name) VALUES (%s, %s) RETURNING id", (slug, name)).fetchone()["id"]
+    db().commit()
+    return jsonify(id=sid, series=series_rows()), 201
+
+
+@app.delete("/api/admin/series/<int:sid>")
+@admin_required
+def admin_series_delete(sid: int):
+    db().execute("UPDATE posts SET series_part = NULL WHERE series_id = %s", (sid,))
+    db().execute("DELETE FROM series WHERE id = %s", (sid,))  # its posts stay, just without a series
+    db().commit()
+    return jsonify(series=series_rows())
+
+
+@app.get("/api/admin/posts/<int:pid>/revisions")
+@admin_required
+def admin_revisions(pid: int):
+    rows = db().execute("SELECT id, title, body_md, created_at FROM post_revisions WHERE post_id = %s"
+                        " ORDER BY id DESC", (pid,)).fetchall()
+    return jsonify(revisions=[{"id": r["id"], "title": r["title"], "date": iso(r["created_at"]),
+                               "words": len(re.findall(r"\w+", r["body_md"]))} for r in rows])
+
+
+@app.get("/api/admin/revisions/<int:rid>")
+@admin_required
+def admin_revision(rid: int):
+    r = db().execute("SELECT r.*, p.body_md AS current FROM post_revisions r JOIN posts p ON p.id = r.post_id"
+                     " WHERE r.id = %s", (rid,)).fetchone()
+    if r is None:
+        return jsonify(error="That version is gone."), 404
+    diff = []
+    for line in list(difflib.unified_diff(r["body_md"].splitlines(), r["current"].splitlines(), lineterm="", n=2))[2:]:
+        diff.append({"op": line[:1] if line[:1] in "+-@" else " ", "text": line if line.startswith("@@") else line[1:]})
+    return jsonify(id=r["id"], title=r["title"], excerpt=r["excerpt"], tags=list(r["tags"]), body=r["body_md"],
+                   date=iso(r["created_at"]), diff=diff)
+
+
+@app.post("/api/admin/posts/<int:pid>/preview-link")
+@admin_required
+def admin_preview_link(pid: int):
+    row = db().execute("UPDATE posts SET preview_token = COALESCE(preview_token, %s) WHERE id = %s"
+                       " RETURNING preview_token", (secrets.token_urlsafe(24), pid)).fetchone()
+    db().commit()
+    if row is None:
+        return jsonify(error="Post not found."), 404
+    return jsonify(url=f"{SITE_URL}/preview/{row['preview_token']}")
+
+
+@app.delete("/api/admin/posts/<int:pid>/preview-link")
+@admin_required
+def admin_preview_link_off(pid: int):
+    db().execute("UPDATE posts SET preview_token = NULL WHERE id = %s", (pid,))
+    db().commit()
+    return jsonify(url=None)
 
 
 @app.get("/api/admin/about")
@@ -1549,7 +1786,8 @@ def sitemap():
 
 @app.get("/robots.txt")
 def robots():
-    return Response(f"User-agent: *\nDisallow: /admin\nSitemap: {SITE_URL}/sitemap.xml\n", mimetype="text/plain")
+    return Response(f"User-agent: *\nDisallow: /admin\nDisallow: /preview\nSitemap: {SITE_URL}/sitemap.xml\n",
+                    mimetype="text/plain")
 
 
 @app.get("/healthz")
@@ -1684,6 +1922,21 @@ def not_found(_exc):
 @app.errorhandler(413)
 def too_large(_exc):
     return jsonify(error="That file is too large (15 MB max)."), 413
+
+
+_last_alert = {"at": 0.0}
+
+
+@app.errorhandler(500)
+def server_error(exc):
+    """Something crashed: tell the owner (at most once every 10 minutes per worker), and say sorry."""
+    original = getattr(exc, "original_exception", None) or exc
+    if time.time() - _last_alert["at"] > 600:
+        _last_alert["at"] = time.time()
+        notify("tolie.space notes: the API hit an error",
+               f"{request.method} {request.path}\n{type(original).__name__}: {str(original)[:500]}\n\n"
+               "Details: docker compose logs api --since 30m")
+    return jsonify(error="Something broke on our side. Try again in a moment."), 500
 
 
 init_db()

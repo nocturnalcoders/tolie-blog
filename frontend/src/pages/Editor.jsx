@@ -2,10 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import Layout from '../components/Layout.jsx';
 import Prose from '../components/Prose.jsx';
+import SeoChecklist from '../components/SeoChecklist.jsx';
+import History from '../components/History.jsx';
+import PreviewLink from '../components/PreviewLink.jsx';
 import { api } from '../api.js';
 import { useApi, useDocumentTitle } from '../hooks.js';
 
-const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '', topic_id: null };
+const EMPTY = { title: '', slug: '', tags: '', excerpt: '', body: '', topic_id: null, series_id: null, series_part: null, lang: 'en', translation_of: null };
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
 // Unsaved work is kept on this device, so a crash, a closed tab or an expired
@@ -36,7 +39,7 @@ function dropDraft(id) {
   }
 }
 
-const sameForm = (a, b) => ['title', 'slug', 'tags', 'excerpt', 'body', 'topic_id'].every((k) => (a[k] ?? '') === (b[k] ?? ''));
+const sameForm = (a, b) => Object.keys(EMPTY).every((k) => (a[k] ?? '') === (b[k] ?? ''));
 
 // <input type="datetime-local"> works in local time, without a zone.
 function localInput(date) {
@@ -83,6 +86,12 @@ export default function Editor() {
   const caretRef = useRef(null); // where the cursor was last, since opening the file picker can lose it
   const [dropping, setDropping] = useState(false);
   const topics = useApi('/api/admin/topics');
+  const [seriesReload, setSeriesReload] = useState(0);
+  const seriesList = useApi('/api/admin/series', seriesReload);
+  const allPosts = useApi('/api/admin/posts');
+  const [newSeries, setNewSeries] = useState(null); // name being typed for a new series
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [historyKey, setHistoryKey] = useState(0);
   useDocumentTitle(`${isNew ? 'New note' : 'Edit note'} · tolie.space notes`);
 
   // Load the post when editing.
@@ -103,7 +112,12 @@ export default function Editor() {
     api(`/api/admin/posts/${id}`)
       .then(({ post }) => {
         if (!alive) return;
-        const fresh = { title: post.title, slug: post.slug, tags: post.tags.join(', '), excerpt: post.excerpt, body: post.body, topic_id: post.topic_id ?? null };
+        const fresh = {
+          title: post.title, slug: post.slug, tags: post.tags.join(', '), excerpt: post.excerpt, body: post.body,
+          topic_id: post.topic_id ?? null, series_id: post.series_id ?? null, series_part: post.series_part ?? null,
+          lang: post.lang || 'en', translation_of: post.translation_of ?? null,
+        };
+        setPreviewUrl(post.preview_url || null);
         setForm(fresh);
         setStatus(post.status);
         setScheduled(post.scheduled ? new Date(post.publish_at) : null);
@@ -174,6 +188,7 @@ export default function Editor() {
         dropDraft(isNew ? null : id);
         if (isNew) dropDraft(res.post.id);
         setScheduled(res.post.scheduled ? new Date(res.post.publish_at) : null);
+        setHistoryKey((n) => n + 1);
         setScheduling(false);
         const verb = { publish: 'Published.', schedule: `Scheduled for ${new Date(res.post.publish_at).toLocaleString()}.` }[action] || 'Saved.';
         if (isNew) {
@@ -340,6 +355,29 @@ export default function Editor() {
     uploadImages(files);
   };
 
+  const setField = (key, value) => {
+    setForm((f) => ({ ...f, [key]: value }));
+    setDirty(true);
+  };
+
+  const createSeries = async () => {
+    try {
+      const r = await api('/api/admin/series', { method: 'POST', body: { name: newSeries } });
+      setSeriesReload((n) => n + 1);
+      setField('series_id', r.id);
+      setNewSeries(null);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const restoreVersion = (rev) => {
+    setForm((f) => ({ ...f, title: rev.title, excerpt: rev.excerpt, tags: rev.tags.join(', '), body: rev.body }));
+    setDirty(true);
+    setMessage('That earlier version is in the editor now. Save to keep it.');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const remove = async () => {
     if (!window.confirm('Delete this note? This can’t be undone.')) return;
     try {
@@ -411,6 +449,69 @@ export default function Editor() {
               <option key={t.id} value={t.id}>{t.name}</option>
             ))}
           </select>
+
+          <div className="two-col">
+            <div>
+              <label htmlFor="series">Series <small>(optional)</small></label>
+              <select
+                id="series"
+                value={newSeries !== null ? 'new' : form.series_id ?? ''}
+                onChange={(e) => {
+                  if (e.target.value === 'new') {
+                    setNewSeries('');
+                    return;
+                  }
+                  setNewSeries(null);
+                  setField('series_id', e.target.value ? Number(e.target.value) : null);
+                }}
+              >
+                <option value="">Not part of a series</option>
+                {(seriesList.data ? seriesList.data.series : []).map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+                <option value="new">+ New series…</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor="series-part">Part <small>(empty: next one)</small></label>
+              <input
+                id="series-part"
+                type="text"
+                inputMode="numeric"
+                disabled={form.series_id === null}
+                value={form.series_part ?? ''}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value, 10);
+                  setField('series_part', Number.isNaN(n) ? null : n);
+                }}
+              />
+            </div>
+          </div>
+          {newSeries !== null && (
+            <div className="inline-edit new-series">
+              <label className="sr" htmlFor="new-series">Name of the new series</label>
+              <input id="new-series" type="text" maxLength={80} placeholder="e.g. Learning Rust" value={newSeries} autoFocus onChange={(e) => setNewSeries(e.target.value)} />
+              <button type="button" onClick={createSeries} disabled={!newSeries.trim()}>Create</button>
+              <button type="button" className="link" onClick={() => setNewSeries(null)}>Cancel</button>
+            </div>
+          )}
+
+          <div className="two-col">
+            <div>
+              <label htmlFor="lang">Language</label>
+              <select id="lang" value={form.lang} onChange={(e) => setField('lang', e.target.value)}>
+                <option value="en">English</option>
+                <option value="id">Bahasa Indonesia</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor="translation">Translation <small>(same note, other language)</small></label>
+              <select id="translation" value={form.translation_of ?? ''} onChange={(e) => setField('translation_of', e.target.value ? Number(e.target.value) : null)}>
+                <option value="">None</option>
+                {(allPosts.data ? allPosts.data.posts : []).filter((x) => String(x.id) !== String(id)).map((x) => (
+                  <option key={x.id} value={x.id}>{x.title}</option>
+                ))}
+              </select>
+            </div>
+          </div>
 
           <div className="two-col">
             <div>
@@ -497,10 +598,16 @@ export default function Editor() {
           )}
         </form>
 
-        <section className="card panel preview">
-          <span className="tab">Preview</span>
-          <Prose html={preview} />
-        </section>
+        <div className="editor-side">
+          <section className="card panel preview">
+            <span className="tab">Preview</span>
+            <Prose html={preview} />
+          </section>
+          <SeoChecklist form={form} />
+          {!isNew && <History postId={id} reloadKey={historyKey} onRestore={restoreVersion} />}
+          {!isNew && status !== 'published' && <PreviewLink key={id} postId={id} initialUrl={previewUrl} />}
+          {!isNew && scheduled && <PreviewLink key={`s-${id}`} postId={id} initialUrl={previewUrl} />}
+        </div>
       </div>
 
       {!isNew && (

@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router-dom';
 import Layout from '../components/Layout.jsx';
-import Prose from '../components/Prose.jsx';
+import { PostArticle, PostHeader } from '../components/PostBody.jsx';
 import Reactions from '../components/Reactions.jsx';
 import Comments from '../components/Comments.jsx';
 import Share from '../components/Share.jsx';
@@ -28,33 +28,8 @@ export default function Post() {
           {post.status !== 'published' && (
             <p className="flash err" role="status">Draft preview. Only you can see this page.</p>
           )}
-          <header className="post-hero">
-            <p className="meta">
-              <Link to="/">Notes</Link>
-              {post.topic && <> · <Link to={`/topic/${post.topic.slug}`}>{post.topic.name}</Link></>}
-              {' '}· {formatDate(post.date)} · {post.read_min} min read
-            </p>
-            <h1>{post.title}</h1>
-            {post.tags.length > 0 && (
-              <ul className="tags">
-                {post.tags.map((t) => <li key={t}><Link to={`/tag/${t}`}>#{t}</Link></li>)}
-              </ul>
-            )}
-          </header>
-          <article className="card article">
-            <span className="tab">{post.topic ? post.topic.name : post.tags[0] || 'Note'}</span>
-            {post.toc && post.toc.length >= 3 && (
-              <nav className="toc" aria-labelledby="toc-title">
-                <p id="toc-title">On this page</p>
-                <ol>
-                  {post.toc.map((t) => (
-                    <li key={t.id} className={`l${t.level}`}><a href={`#${t.id}`}>{t.title}</a></li>
-                  ))}
-                </ol>
-              </nav>
-            )}
-            <Prose html={post.html} />
-          </article>
+          <PostHeader post={post} />
+          <PostArticle post={post} />
           {post.status === 'published' && <Reactions key={`reactions-${post.slug}`} slug={post.slug} />}
           {post.status === 'published' && <Share key={`share-${post.slug}`} slug={post.slug} title={post.title} />}
           <aside className="card author">

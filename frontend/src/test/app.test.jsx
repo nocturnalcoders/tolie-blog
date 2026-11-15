@@ -427,8 +427,8 @@ describe('admin', () => {
     await screen.findByRole('option', { name: 'Hardware' });
     await userEvent.selectOptions(screen.getByLabelText(/^Topic/), 'Hardware');
     await userEvent.click(screen.getByRole('button', { name: 'Save draft' }));
-    await waitFor(() => expect(be.calls.some((c) => c.url === '/api/admin/posts')).toBe(true));
-    expect(JSON.parse(be.calls.find((c) => c.url === '/api/admin/posts').body)).toMatchObject({ title: 'Chips', topic_id: 4 });
+    await waitFor(() => expect(be.calls.some((c) => c.method === 'POST' && c.url === '/api/admin/posts')).toBe(true));
+    expect(JSON.parse(be.calls.find((c) => c.method === 'POST' && c.url === '/api/admin/posts').body)).toMatchObject({ title: 'Chips', topic_id: 4 });
     // reopened for editing, the topic is still picked
     await waitFor(() => expect(screen.getByLabelText(/^Topic/)).toHaveValue('4'));
   });
@@ -470,7 +470,7 @@ describe('admin', () => {
     renderAt('/admin/new');
     await userEvent.click(await screen.findByRole('button', { name: 'Save draft' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Give the post a title first.');
-    expect(be.calls.some((c) => c.url === '/api/admin/posts')).toBe(false);
+    expect(be.calls.some((c) => c.method === 'POST' && c.url === '/api/admin/posts')).toBe(false);
   });
 
   it('login asks for the authenticator code when two-factor is on', async () => {
@@ -548,8 +548,8 @@ describe('admin', () => {
     await userEvent.clear(when);
     await userEvent.type(when, '2030-01-02T08:00');
     await userEvent.click(screen.getByRole('button', { name: 'Schedule' }));
-    await waitFor(() => expect(be.calls.some((c) => c.url === '/api/admin/posts')).toBe(true));
-    const sent = JSON.parse(be.calls.find((c) => c.url === '/api/admin/posts').body);
+    await waitFor(() => expect(be.calls.some((c) => c.method === 'POST' && c.url === '/api/admin/posts')).toBe(true));
+    const sent = JSON.parse(be.calls.find((c) => c.method === 'POST' && c.url === '/api/admin/posts').body);
     expect(sent.action).toBe('schedule');
     expect(new Date(sent.publish_at).getTime()).toBe(new Date('2030-01-02T08:00').getTime());
     expect(await screen.findByText(/Scheduled to go out on/)).toBeInTheDocument();
@@ -689,3 +689,128 @@ describe('about, archive, letters, pictures, replies', () => {
       .toEqual({ name: 'Budi', body: 'Same here', website: '', parent_id: 1, email: 'budi@example.com', notify: true });
   });
 });
+
+describe('series, search, languages, history, previews', () => {
+  const postApi = (extra) => [200, { post: { ...POSTS[0], status: 'published', html: '<p>Body</p>', ...extra }, prev: null, next: null }];
+
+  it('home shows popular notes on the front page only', async () => {
+    const be = fakeBackend({ ...publicRoutes, 'GET /api/popular': () => [200, { posts: [{ ...POSTS[1], views: 9 }, { ...POSTS[0], views: 4 }] }] });
+    const view = renderAt('/');
+    const box = await screen.findByText('Popular this week');
+    expect(within(box.closest('section')).getAllByRole('link').map((l) => l.textContent)).toEqual(['Futsal and code reviews', 'Hello from the little town']);
+    view.unmount();
+    be.calls.length = 0;
+    renderAt('/tag/futsal');
+    await screen.findByRole('heading', { name: 'Notes tagged #futsal' });
+    expect(be.calls.some((c) => c.url === '/api/popular')).toBe(false);
+  });
+
+  it('search results show the matching words in bold, safely', async () => {
+    fakeBackend({
+      ...publicRoutes,
+      'GET /api/posts': () => [200, { posts: [{ ...POSTS[0], snippet: [{ text: 'we run ', hit: false }, { text: 'kubernetes', hit: true }, { text: ' <b>daily</b>', hit: false }] }], total: 1, page: 1, pages: 1, q: 'kubernetes', tag: '' }],
+    });
+    renderAt('/?q=kubernetes');
+    const mark = await screen.findByText('kubernetes', { selector: 'mark' });
+    expect(mark.closest('.snippet')).toHaveTextContent('… we run kubernetes <b>daily</b> …');
+    expect(document.querySelector('.snippet b')).toBeNull();
+  });
+
+  it('a post in a series shows where it sits and what comes next', async () => {
+    fakeBackend({
+      'GET /api/posts/hello': () => postApi({ series: { slug: 'rust', name: 'Learning Rust', parts: [
+        { slug: 'hello', title: 'Hello from the little town', current: true }, { slug: 'two', title: 'Part two', current: false },
+      ] } }),
+    });
+    renderAt('/post/hello');
+    const box = await screen.findByRole('navigation', { name: 'Series: Learning Rust' });
+    expect(box).toHaveTextContent('Part 1 of 2 in Learning Rust');
+    expect(within(box).getByRole('link', { name: 'Learning Rust' })).toHaveAttribute('href', '/series/rust');
+    expect(screen.getByRole('link', { name: 'Next in the series: Part two →' })).toHaveAttribute('href', '/post/two');
+  });
+
+  it('series page lists the parts in order', async () => {
+    fakeBackend({ 'GET /api/series/rust': () => [200, { series: { slug: 'rust', name: 'Learning Rust' }, posts: [POSTS[0], POSTS[1]] }] });
+    renderAt('/series/rust');
+    expect(await screen.findByRole('heading', { name: 'Learning Rust' })).toBeInTheDocument();
+    expect(screen.getByText(/A series in 2 parts/)).toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(['Hello from the little town', 'Futsal and code reviews']);
+  });
+
+  it('a post links to its translation and marks its language', async () => {
+    fakeBackend({ 'GET /api/posts/hello': () => postApi({ lang: 'en', translation: { slug: 'halo', title: 'Halo', lang: 'id', language: 'Bahasa Indonesia' } }) });
+    renderAt('/post/hello');
+    const link = await screen.findByRole('link', { name: 'Baca dalam Bahasa Indonesia →' });
+    expect(link).toHaveAttribute('href', '/post/halo');
+    expect(link).toHaveAttribute('hreflang', 'id');
+    expect(document.querySelector('article.article')).toHaveAttribute('lang', 'en');
+  });
+
+  it('a secret preview link shows the draft, with a note and no comments', async () => {
+    fakeBackend({ 'GET /api/preview/tok-abcdefghijklmnopqrstuvwxyz': () => [200, { post: { ...POSTS[0], html: '<p>Not yet out</p>', live: false } }] });
+    renderAt('/preview/tok-abcdefghijklmnopqrstuvwxyz');
+    expect(await screen.findByText('Not yet out')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('isn’t published yet');
+    expect(screen.queryByRole('region', { name: /comments/i })).not.toBeInTheDocument();
+    expect(document.head.querySelector('meta[name="robots"]')).toHaveAttribute('content', 'noindex');
+  });
+
+  it('editor: series, language, translation and the SEO checks', async () => {
+    let series = [];
+    const be = fakeBackend({
+      'POST /api/admin/preview': () => [200, { html: '' }],
+      'GET /api/admin/topics': () => [200, { topics: [] }],
+      'GET /api/admin/series': () => [200, { series }],
+      'POST /api/admin/series': (_u, o) => { series = [{ id: 11, slug: 'rust', name: JSON.parse(o.body).name, count: 0 }]; return [201, { id: 11, series }]; },
+      'GET /api/admin/posts': () => [200, { posts: [{ ...POSTS[1], status: 'published', updated_at: '2026-11-13T10:00:00Z' }] }],
+      'POST /api/admin/posts': (_u, o) => [201, { post: { id: 12, ...JSON.parse(o.body), tags: [], status: 'draft' } }],
+      'GET /api/admin/posts/12': () => [200, { post: { id: 12, slug: 'x', title: 'Belajar Rust bagian satu', excerpt: '', tags: [], status: 'draft', body: '', series_id: 11, series_part: 1, lang: 'id', translation_of: 2 } }],
+      'GET /api/admin/posts/12/revisions': () => [200, { revisions: [] }],
+    }, { admin: true });
+    renderAt('/admin/new');
+    const seo = await screen.findByRole('region', { name: /thing.* to look at/ });
+    expect(within(seo).getByText(/Title is very short/)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Title'), 'Belajar Rust bagian satu');
+    expect(within(seo).getByText('Title length is good.')).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Write in Markdown'), '![[](/uploads/x.webp)'); // [[ types a [
+    expect(within(seo).getByText(/1 picture has no description/)).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText(/^Series/), '+ New series…');
+    await userEvent.type(screen.getByLabelText('Name of the new series'), 'Learning Rust');
+    await userEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(screen.getByLabelText(/^Series/)).toHaveValue('11'));
+    await userEvent.selectOptions(screen.getByLabelText('Language'), 'Bahasa Indonesia');
+    await userEvent.selectOptions(screen.getByLabelText(/^Translation/), 'Futsal and code reviews');
+    await userEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+    await waitFor(() => expect(be.calls.some((c) => c.method === 'POST' && c.url === '/api/admin/posts')).toBe(true));
+    expect(JSON.parse(be.calls.find((c) => c.method === 'POST' && c.url === '/api/admin/posts').body))
+      .toMatchObject({ series_id: 11, series_part: null, lang: 'id', translation_of: 2 });
+  });
+
+  it('editor history shows what changed and puts an old version back', async () => {
+    fakeBackend({
+      'POST /api/admin/preview': () => [200, { html: '' }],
+      'GET /api/admin/posts/3': () => [200, { post: { id: 3, slug: 'n', title: 'Now', excerpt: '', tags: [], status: 'draft', body: 'Walking slowly.' } }],
+      'GET /api/admin/posts/3/revisions': () => [200, { revisions: [{ id: 41, title: 'Then', date: '2026-11-14T10:00:00Z', words: 1 }] }],
+      'GET /api/admin/revisions/41': () => [200, { id: 41, title: 'Then', excerpt: 'Old summary', tags: ['walk'], body: 'Walking.', date: '2026-11-14T10:00:00Z',
+        diff: [{ op: '@', text: '@@ -1 +1 @@' }, { op: '-', text: 'Walking.' }, { op: '+', text: 'Walking slowly.' }] }],
+      'POST /api/admin/posts/3/preview-link': () => [200, { url: 'https://blog.example.test/preview/abc' }],
+    }, { admin: true });
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: vi.fn(async () => {}) }, configurable: true });
+    renderAt('/admin/edit/3');
+    const history = await screen.findByRole('region', { name: 'Earlier versions' });
+    await userEvent.click(await within(history).findByRole('button', { name: new Date('2026-11-14T10:00:00Z').toLocaleString() }));
+    expect(await within(history).findByText('- Walking.')).toHaveClass('d-del');
+    expect(within(history).getByText('+ Walking slowly.')).toHaveClass('d-add');
+    await userEvent.click(within(history).getByRole('button', { name: 'Put this version in the editor' }));
+    expect(screen.getByLabelText('Write in Markdown')).toHaveValue('Walking.');
+    expect(screen.getByLabelText('Title')).toHaveValue('Then');
+    expect(screen.getByRole('status')).toHaveTextContent('Save to keep it.');
+
+    const share = screen.getByRole('region', { name: 'Share a preview' });
+    await userEvent.click(within(share).getByRole('button', { name: 'Make a preview link' }));
+    expect(await within(share).findByLabelText('Preview link')).toHaveValue('https://blog.example.test/preview/abc');
+    expect(within(share).getByRole('status')).toHaveTextContent('Link copied.');
+  });
+});
+

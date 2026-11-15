@@ -21,6 +21,8 @@ export default function Home() {
   const list = useApi(`/api/posts?${qs.toString()}`);
   const tags = useApi(`/api/tags?limit=${TOP_TAGS}`);
   const topics = useApi('/api/topics');
+  const front = !tag && !topic && !q && page === 1; // the plain home page
+  const popular = useApi(front ? '/api/popular' : null);
 
   const [draft, setDraft] = useState(q);
   useEffect(() => setDraft(q), [q]);
@@ -96,6 +98,21 @@ export default function Home() {
       {list.loading && !list.data && <p className="note">Loading notes…</p>}
       {list.error && (
         <div className="card empty"><span className="tab">Oops</span><p>{list.error.message}</p></div>
+      )}
+
+      {front && popular.data && popular.data.posts.length >= 2 && (
+        <section className="card popular" aria-labelledby="popular-title">
+          <span className="tab">Popular this week</span>
+          <h2 id="popular-title" className="sr">Most read this week</h2>
+          <ol>
+            {popular.data.posts.map((p) => (
+              <li key={p.slug}>
+                <Link to={`/post/${p.slug}`}>{p.title}</Link>
+                {p.topic && <span className="muted"> · {p.topic.name}</span>}
+              </li>
+            ))}
+          </ol>
+        </section>
       )}
 
       {posts.map((p) => <PostCard key={p.slug} post={p} />)}

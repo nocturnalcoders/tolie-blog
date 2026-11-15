@@ -15,6 +15,8 @@ import Security from './pages/Security.jsx';
 import About from './pages/About.jsx';
 import AboutEdit from './pages/AboutEdit.jsx';
 import Archive from './pages/Archive.jsx';
+import Series from './pages/Series.jsx';
+import Preview from './pages/Preview.jsx';
 import Confirm from './pages/Confirm.jsx';
 import Unsubscribe from './pages/Unsubscribe.jsx';
 import { usePageViews } from './hooks.js';
@@ -44,6 +46,8 @@ export default function App() {
       <Route path="/tags" element={<Tags />} />
       <Route path="/about" element={<About />} />
       <Route path="/archive" element={<Archive />} />
+      <Route path="/series/:slug" element={<Series />} />
+      <Route path="/preview/:token" element={<Preview />} />
       <Route path="/subscribe/confirm" element={<Confirm />} />
       <Route path="/unsubscribe" element={<Unsubscribe />} />
       <Route path="/admin/about" element={<RequireAdmin><AboutEdit /></RequireAdmin>} />

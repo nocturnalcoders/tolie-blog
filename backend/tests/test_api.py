@@ -413,6 +413,98 @@ import subprocess
 out = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / 'manage.py'), 'disable-2fa'], capture_output=True, text=True, env={**os.environ})
 ok('manage.py disable-2fa (lost phone)', 'is off' in out.stdout and c.get('/api/admin/2fa').json['enabled'] is False)
 
+# full-text search
+def post_(title, body='Body.', **kw):
+    r = J(c, 'post', '/api/admin/posts', {'title': title, 'body': body, 'action': kw.pop('action', 'publish'), **kw}, tok)
+    assert r.status_code == 201, r.json
+    return r.json['post']
+k8s = post_('Kubernetes in production', 'We run Kubernetes clusters every day. <b>bold</b> **kubernetes** tips.', tags='k8s')
+cook = post_('Notes on cooking', 'Rice, eggs, and a story.\n\nAt the end I mention kubernetes once.')
+r = anon.get('/api/posts?q=kubernetes').json
+ok('search ranks the title match first', [p['slug'] for p in r['posts'][:2]] == ['kubernetes-in-production', 'notes-on-cooking'])
+hits = [x['text'].lower() for x in r['posts'][1]['snippet'] if x['hit']]
+ok('snippet marks the matching words', hits and all(h == 'kubernetes' for h in hits) and not any('**' in x['text'] for x in r['posts'][0]['snippet']))
+ok('snippet is plain text parts, not html', all(set(x) == {'text', 'hit'} for x in r['posts'][0]['snippet']))
+ok('search still finds part of a word', anon.get('/api/posts?q=kube').json['total'] == 2)
+ok('two words both count', [p['slug'] for p in anon.get('/api/posts?q=rice eggs').json['posts']] == ['notes-on-cooking'])
+ok('no snippet without a search', 'snippet' not in anon.get('/api/posts').json['posts'][0])
+
+# popular
+for i in range(3):
+    track(A.app.test_client(), '/post/kubernetes-in-production', '', {'User-Agent': f'Mozilla/5.0 Reader{i}'})
+track(A.app.test_client(), '/post/notes-on-cooking', '', {'User-Agent': 'Mozilla/5.0 ReaderX'})
+pop = anon.get('/api/popular').json['posts']
+ok('popular this week, most read first', [p['slug'] for p in pop[:2]] == ['kubernetes-in-production', 'notes-on-cooking'] and pop[0]['views'] == 3)
+
+# series
+ok('series admin only', J(v, 'post', '/api/admin/series', {'name': 'x'}, vt).status_code == 401)
+sid = J(c, 'post', '/api/admin/series', {'name': 'Learning Rust'}, tok).json['id']
+ok('second series with the same name gets its own address', J(c, 'post', '/api/admin/series', {'name': 'Learning Rust'}, tok).json['series'][1]['slug'] == 'learning-rust-2')
+p1 = post_('Rust part one', series_id=sid)
+p2 = post_('Rust part two', series_id=sid)
+p3 = post_('Rust part three', series_id=sid, action='draft')
+ok('parts are numbered automatically', (p1['series_part'], p2['series_part'], p3['series_part']) == (1, 2, 3))
+box = anon.get('/api/posts/rust-part-one').json['post']['series']
+ok('series box lists published parts in order', box['name'] == 'Learning Rust' and [x['slug'] for x in box['parts']] == ['rust-part-one', 'rust-part-two'] and box['parts'][0]['current'] is True)
+ok('admin sees the draft part in its own preview', [x['slug'] for x in c.get('/api/posts/rust-part-three').json['post']['series']['parts']] == ['rust-part-one', 'rust-part-two', 'rust-part-three'])
+ok('series page', [x['slug'] for x in anon.get('/api/series/learning-rust').json['posts']] == ['rust-part-one', 'rust-part-two'] and anon.get('/api/series/nope').status_code == 404)
+J(c, 'put', f"/api/admin/posts/{p1['id']}", {'title': 'Rust part one', 'body': 'Body.', 'series_id': sid, 'series_part': 9, 'action': 'save'}, tok)
+ok('part number can be set', [x['slug'] for x in anon.get('/api/series/learning-rust').json['posts']] == ['rust-part-two', 'rust-part-one'])
+ok('unknown series refused', J(c, 'post', '/api/admin/posts', {'title': 'x', 'series_id': 999999}, tok).status_code == 400)
+J(c, 'delete', f'/api/admin/series/{sid}', None, tok)
+ok('deleting a series keeps the posts', anon.get('/api/posts/rust-part-one').json['post']['series'] is None)
+
+# translations
+en = post_('Night walks', 'Walking.', lang='en')
+idp = post_('Jalan malam', 'Berjalan.', lang='id', translation_of=en['id'])
+ok('language saved', idp['lang'] == 'id' and post_('Bad lang', lang='xx')['lang'] == 'en')
+tr = anon.get('/api/posts/night-walks').json['post']['translation']
+ok('translations point at each other', tr == {'slug': 'jalan-malam', 'title': 'Jalan malam', 'lang': 'id', 'language': 'Bahasa Indonesia'}
+   and anon.get('/api/posts/jalan-malam').json['post']['translation']['slug'] == 'night-walks')
+other = post_('Night walks again', 'x')
+J(c, 'put', f"/api/admin/posts/{idp['id']}", {'title': 'Jalan malam', 'body': 'Berjalan.', 'lang': 'id', 'translation_of': other['id'], 'action': 'save'}, tok)
+ok('re-pairing lets the old partner go', anon.get('/api/posts/night-walks').json['post']['translation'] is None and anon.get('/api/posts/night-walks-again').json['post']['translation']['slug'] == 'jalan-malam')
+ok('a post cannot translate itself', J(c, 'put', f"/api/admin/posts/{idp['id']}", {'title': 'Jalan malam', 'translation_of': idp['id']}, tok).status_code == 400)
+
+# revisions
+pid_ = en['id']
+J(c, 'put', f'/api/admin/posts/{pid_}', {'title': 'Night walks', 'body': 'Walking.\nIn Jakarta.', 'lang': 'en', 'action': 'save'}, tok)
+J(c, 'put', f'/api/admin/posts/{pid_}', {'title': 'Night walks', 'body': 'Walking slowly.\nIn Jakarta.', 'lang': 'en', 'action': 'save'}, tok)
+J(c, 'put', f'/api/admin/posts/{pid_}', {'title': 'Night walks', 'body': 'Walking slowly.\nIn Jakarta.', 'lang': 'en', 'action': 'save'}, tok)
+revs = c.get(f'/api/admin/posts/{pid_}/revisions').json['revisions']
+ok('a version is kept per real change only', len(revs) == 2 and revs[0]['id'] > revs[1]['id'])
+rv = c.get(f"/api/admin/revisions/{revs[1]['id']}").json
+ok('old version + diff against now', rv['body'] == 'Walking.' and {'op': '-', 'text': 'Walking.'} in rv['diff'] and {'op': '+', 'text': 'Walking slowly.'} in rv['diff'])
+ok('revisions are admin only', anon.get(f'/api/admin/posts/{pid_}/revisions').status_code == 401)
+
+# secret preview links
+d = post_('Secret draft', 'Not yet.', action='draft')
+ok('draft hidden', anon.get('/api/posts/secret-draft').status_code == 404)
+url = J(c, 'post', f"/api/admin/posts/{d['id']}/preview-link", None, tok).json['url']
+token_ = url.rsplit('/', 1)[1]
+r = anon.get(f'/api/preview/{token_}')
+ok('preview link shows the draft to anyone with it', url.startswith('https://blog.example.test/preview/') and r.status_code == 200 and 'Not yet.' in r.json['post']['html'] and r.json['post']['live'] is False and r.headers['X-Robots-Tag'] == 'noindex')
+ok('same link when asked again', J(c, 'post', f"/api/admin/posts/{d['id']}/preview-link", None, tok).json['url'] == url and c.get(f"/api/admin/posts/{d['id']}").json['post']['preview_url'] == url)
+J(c, 'delete', f"/api/admin/posts/{d['id']}/preview-link", None, tok)
+ok('switched off link stops working', anon.get(f'/api/preview/{token_}').status_code == 404 and anon.get('/api/preview/short').status_code == 404)
+ok('robots keeps previews out', b'Disallow: /preview' in anon.get('/robots.txt').data)
+
+# error alerts
+alerts = []
+real_notify, real_view = A.notify, A.app.view_functions['api_about']
+A.notify = lambda subject, text: alerts.append((subject, text))
+def boom(): raise RuntimeError('database on fire')
+A.app.view_functions['api_about'] = boom
+A._last_alert['at'] = 0
+A.app.logger.disabled = True  # the crash below is on purpose
+r = anon.get('/api/about'); anon.get('/api/about')
+ok('a crash answers politely and alerts once', r.status_code == 500 and 'Something broke' in r.json['error'] and len(alerts) == 1 and 'RuntimeError: database on fire' in alerts[0][1] and '/api/about' in alerts[0][1])
+A.notify, A.app.view_functions['api_about'] = real_notify, real_view
+A.app.logger.disabled = False
+for p_ in (k8s, cook, p1, p2, p3, en, idp, other, d):
+    J(c, 'delete', f"/api/admin/posts/{p_['id']}", None, tok)
+J(c, 'delete', '/api/admin/posts/' + str([x for x in c.get('/api/admin/posts').json['posts'] if x['slug'] == 'bad-lang'][0]['id']), None, tok)
+
 # delete / logout / lockout
 ok('delete', J(c, 'delete', f'/api/admin/posts/{pid2}', None, tok).status_code == 200 and c.get(f'/api/posts/my-first-draft-2').status_code == 404)
 r = J(c, 'post', '/api/logout', None, tok); ok('logout', r.json['admin'] is False and c.get('/api/admin/posts').status_code == 401)

@@ -7,3 +7,6 @@ afterEach(() => {
   document.documentElement.setAttribute('data-theme', 'night');
   localStorage.clear();
 });
+
+// jsdom has no scrolling
+window.scrollTo = () => {};
